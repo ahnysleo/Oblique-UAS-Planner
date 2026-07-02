@@ -1,0 +1,10 @@
+streamlit
+numpy
+pandas
+matplotlib
+shapely
+pyproj
+simplekml
+lxml
+reportlab
+Pillow
