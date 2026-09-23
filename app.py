@@ -122,8 +122,11 @@ class Scenario:
     trigger_mode: str = "Distance-based"
 
     survey_mode: str = "Cal Expo Validation Mode"
-    gcp_spacing_ft: float = 300.0
-    checkpoint_spacing_ft: float = 300.0
+    # Version 3.7: these are minimum same-type longitudinal separations, not target spacings.
+    gcp_spacing_ft: float = 150.0
+    checkpoint_spacing_ft: float = 75.0
+    maximum_gcp_count: int = 10
+    maximum_checkpoint_count: int = 30
     gcp_offset_from_road_edge_ft: float = 25.0
     checkpoint_offset_from_road_edge_ft: float = 25.0
     safety_offset_ft: float = 10.0
@@ -134,7 +137,7 @@ class Scenario:
     include_near_far_zone_checkpoints: bool = False
     include_outside_checkpoints: bool = True
     checkpoint_distribution: str = "Balanced: Centerline + Road Edges + Outside"
-    minimum_checkpoint_count: int = 50
+    minimum_checkpoint_count: int = 30
 
     # Version 3.2 corridor-control experiment design fields.
     positioning_mode: str = "RTK/PPK + GCP"
@@ -144,7 +147,7 @@ class Scenario:
     force_start_terminal_pair: bool = True
     force_end_terminal_pair: bool = True
     terminal_pair_inset_ft: float = 0.0
-    minimum_gcp_count: int = 4
+    minimum_gcp_count: int = 0  # retained for backward-compatible reports; max count controls generation
     minimum_gcp_checkpoint_separation_ft: float = 50.0
 
     show_footprints: bool = True
@@ -791,205 +794,169 @@ def gcp_layout_metrics(center_xy: List[Tuple[float, float]], s: Scenario, target
 
 
 def build_targets(center_xy: List[Tuple[float, float]], s: Scenario) -> Dict:
-    """Generate GCPs and checkpoints.
+    """Generate spatially balanced GCPs and independent checkpoints.
 
-    Version 2.0 checkpoint strategy:
-    - GCPs remain outside the roadway.
-    - The default checkpoint distribution is balanced among three practical
-      accuracy-assessment zones: Roadway Center, Roadway Edge Zone, and Outside Roadway.
-    - The default checkpoint spacing is 300 ft, but if the total number of
-      checkpoints is below minimum_checkpoint_count, the app densifies the
-      station interval automatically while keeping the same zone balance.
-    - For both-side placement, roadway-edge and outside-roadway points alternate
-      left/right by station. This keeps the counts balanced by zone while still
-      distributing points across both sides of the corridor.
-
-    Roadway center and edge-zone checkpoints can be validated using mobile
-    mapping, road marking extraction, or controlled test-site access. Outside-roadway
-    checkpoints are safer conventional GNSS/total station targets.
+    Version 3.7 target-layout strategy:
+    - GCP and checkpoint counts are controlled by user-defined maximum counts.
+    - Points are distributed approximately uniformly along the full corridor.
+    - Same-type points respect a user-defined minimum longitudinal spacing when possible.
+    - Checkpoints are rejected when they fall within the GCP-to-checkpoint separation threshold.
+    - Default checkpoint quotas emphasize roadway validation: 40% center, 40% road-edge, 20% outside.
+    - Terminal GCP pairs are retained when requested and count toward the GCP maximum.
     """
     gcps: List[Dict] = []
     checkpoints: List[Dict] = []
-    sides = ["Left", "Right"] if s.placement_side == "Both" else [s.placement_side]
+    total_len = polyline_length(center_xy)
 
-    def add_checkpoint(x: float, y: float, side: str, station_ft: float, zone: str, source: str) -> None:
+    def add_checkpoint_at(d: float, side: str, zone: str, source: str, signed_off: float) -> bool:
+        x, y, heading = interpolate_polyline(center_xy, d)
+        nx, ny = -math.sin(heading), math.cos(heading)
+        px, py = x + nx * signed_off, y + ny * signed_off
+        if gcps and distance_to_nearest((px, py), gcps) < s.minimum_gcp_checkpoint_separation_ft:
+            return False
         checkpoints.append({
-            "id": f"CP_{len(checkpoints)+1:03d}",
-            "x": x,
-            "y": y,
-            "side": side,
-            "station_ft": station_ft,
-            "zone": zone,
-            "source": source,
+            "id": f"CP_{len(checkpoints)+1:03d}", "x": px, "y": py,
+            "side": side, "station_ft": d, "zone": zone, "source": source,
         })
+        return True
 
-    def add_gcp(d: float, x: float, y: float, heading: float, side: str, terminal: str = "Interior") -> None:
+    def add_gcp_at(d: float, side: str, terminal: str = "Interior") -> bool:
+        if len(gcps) >= s.maximum_gcp_count:
+            return False
+        x, y, heading = interpolate_polyline(center_xy, d)
         nx, ny = -math.sin(heading), math.cos(heading)
         if side == "Center":
-            signed_off = 0.0
-            zone = "Roadway Center"
-            source = "Experimental Survey Control"
+            signed_off, zone, source = 0.0, "Roadway Center", "Experimental Survey Control"
         else:
             sign = 1.0 if side == "Left" else -1.0
             signed_off = sign * (s.roadway_width_ft / 2.0 + s.gcp_offset_from_road_edge_ft + s.safety_offset_ft)
-            zone = "Outside Roadway"
-            source = "Survey Control"
+            zone, source = "Outside Roadway", "Survey Control"
         gcps.append({
-            "id": f"GCP_{len(gcps)+1:03d}",
-            "x": x + nx * signed_off,
-            "y": y + ny * signed_off,
-            "side": side,
-            "station_ft": d,
-            "signed_offset_ft": signed_off,
-            "terminal": terminal,
-            "pattern": s.gcp_pattern,
-            "zone": zone,
-            "source": source,
+            "id": f"GCP_{len(gcps)+1:03d}", "x": x + nx * signed_off, "y": y + ny * signed_off,
+            "side": side, "station_ft": d, "signed_offset_ft": signed_off,
+            "terminal": terminal, "pattern": s.gcp_pattern, "zone": zone, "source": source,
         })
+        return True
 
-    # GCP-free is a valid research configuration when direct georeferencing is being tested.
-    if s.ground_control_strategy != "GCP-free":
-        total_len = polyline_length(center_xy)
+    def evenly_spaced_ds(count: int, start: float = 0.0, end: Optional[float] = None) -> List[float]:
+        if count <= 0:
+            return []
+        if end is None:
+            end = total_len
+        if count == 1:
+            return [(start + end) / 2.0]
+        return [start + i * (end - start) / (count - 1) for i in range(count)]
+
+    # ---- GCP layout: maximum-count driven ----
+    if s.ground_control_strategy != "GCP-free" and s.maximum_gcp_count > 0:
         inset = max(0.0, min(s.terminal_pair_inset_ft, total_len / 2.0))
-
-        # Terminal pairs are explicitly controlled for the staggered + terminal pattern.
-        terminal_ds = set()
+        terminal_stations = []
         if s.gcp_pattern == "Staggered + Terminal Pairs":
-            if s.force_start_terminal_pair:
-                d = inset
-                x, y, h = interpolate_polyline(center_xy, d)
-                add_gcp(d, x, y, h, "Left", "Start")
-                add_gcp(d, x, y, h, "Right", "Start")
-                terminal_ds.add(round(d, 6))
-            if s.force_end_terminal_pair:
+            if s.force_start_terminal_pair and s.maximum_gcp_count >= 2:
+                add_gcp_at(inset, "Left", "Start"); add_gcp_at(inset, "Right", "Start")
+                terminal_stations.append(inset)
+            if s.force_end_terminal_pair and len(gcps) + 2 <= s.maximum_gcp_count:
                 d = max(0.0, total_len - inset)
-                if round(d, 6) not in terminal_ds:
-                    x, y, h = interpolate_polyline(center_xy, d)
-                    add_gcp(d, x, y, h, "Left", "End")
-                    add_gcp(d, x, y, h, "Right", "End")
-                    terminal_ds.add(round(d, 6))
+                if not terminal_stations or abs(d - terminal_stations[0]) > 1e-6:
+                    add_gcp_at(d, "Left", "End"); add_gcp_at(d, "Right", "End")
+                    terminal_stations.append(d)
 
-        stations = points_at_interval(center_xy, s.gcp_spacing_ft)
-        interior_index = 0
-        for d, x, y, heading in stations:
-            # Avoid duplicating terminal stations already created as pairs.
-            if round(d, 6) in terminal_ds:
-                continue
-            pattern = s.gcp_pattern
-            if pattern == "Bilateral Pairs":
-                active_sides = ["Left", "Right"] if s.placement_side == "Both" else [s.placement_side]
-            elif pattern in ("Staggered", "Staggered + Terminal Pairs"):
-                if s.placement_side == "Both":
-                    active_sides = ["Left" if interior_index % 2 == 0 else "Right"]
-                else:
-                    active_sides = [s.placement_side]
-            elif pattern == "One-Sided":
-                active_sides = [s.gcp_one_sided_side]
-            elif pattern == "Centerline":
-                active_sides = ["Center"]
+        remaining = max(0, s.maximum_gcp_count - len(gcps))
+        if remaining:
+            # Keep interior stations away from terminal stations and spread them over the usable corridor.
+            margin = min(max(s.gcp_spacing_ft, 1.0), total_len / 3.0)
+            start_d = margin if terminal_stations else 0.0
+            end_d = max(start_d, total_len - margin) if terminal_stations else total_len
+            if s.gcp_pattern == "Bilateral Pairs":
+                station_count = max(1, math.ceil(remaining / 2))
+                for d in evenly_spaced_ds(station_count, start_d, end_d):
+                    active = ["Left", "Right"] if s.placement_side == "Both" else [s.placement_side]
+                    for side in active:
+                        if len(gcps) < s.maximum_gcp_count: add_gcp_at(d, side)
             else:
-                active_sides = ["Left", "Right"] if s.placement_side == "Both" else [s.placement_side]
-            for side in active_sides:
-                add_gcp(d, x, y, heading, side, "Interior")
-            interior_index += 1
+                ds = evenly_spaced_ds(remaining, start_d, end_d)
+                for i, d in enumerate(ds):
+                    if s.gcp_pattern in ("Staggered", "Staggered + Terminal Pairs"):
+                        side = ("Left" if i % 2 == 0 else "Right") if s.placement_side == "Both" else s.placement_side
+                    elif s.gcp_pattern == "One-Sided": side = s.gcp_one_sided_side
+                    elif s.gcp_pattern == "Centerline": side = "Center"
+                    else: side = ("Left" if i % 2 == 0 else "Right")
+                    add_gcp_at(d, side)
 
-    def alternating_side(station_index: int) -> str:
-        if s.placement_side != "Both":
-            return s.placement_side
-        return "Left" if station_index % 2 == 0 else "Right"
+    # ---- Checkpoint layout: maximum-count driven with roadway emphasis ----
+    max_cp = max(0, int(s.maximum_checkpoint_count))
+    distribution = s.checkpoint_distribution
+    if distribution.startswith("Balanced"):
+        center_n = int(round(max_cp * 0.40))
+        edge_n = int(round(max_cp * 0.40))
+        outside_n = max_cp - center_n - edge_n
+        zone_plan = [("Roadway Center", center_n), ("Roadway Edge Zone", edge_n), ("Outside Roadway", outside_n)]
+    elif distribution == "Centerline only": zone_plan = [("Roadway Center", max_cp)]
+    elif distribution == "Road edges only": zone_plan = [("Roadway Edge Zone", max_cp)]
+    elif distribution == "Outside roadway only": zone_plan = [("Outside Roadway", max_cp)]
+    else:
+        enabled = []
+        if s.include_centerline_checkpoints: enabled.append("Roadway Center")
+        if s.include_edge_checkpoints: enabled.append("Roadway Edge Zone")
+        if s.include_near_far_zone_checkpoints: enabled.append("Roadway Near/Far Zone")
+        if s.include_outside_checkpoints: enabled.append("Outside Roadway")
+        base = max_cp // max(len(enabled), 1); rem = max_cp % max(len(enabled), 1)
+        zone_plan = [(z, base + (1 if i < rem else 0)) for i, z in enumerate(enabled)]
 
-    def add_edge_checkpoint(x: float, y: float, nx: float, ny: float, d: float, station_index: int) -> None:
-        side = alternating_side(station_index)
+    def zone_offset(zone: str, idx: int) -> Tuple[str, float, str]:
+        if zone == "Roadway Center": return "Center", 0.0, "MMS or Controlled Access"
+        if zone == "Roadway Edge Zone":
+            side = s.placement_side if s.placement_side != "Both" else ("Left" if idx % 2 == 0 else "Right")
+            sign = 1.0 if side == "Left" else -1.0
+            return side, sign * max(0.0, s.roadway_width_ft / 2.0 - s.checkpoint_offset_from_road_edge_ft), "MMS or Controlled Access"
+        if zone == "Roadway Near/Far Zone":
+            side = "Left Near/Far" if idx % 2 == 0 else "Right Near/Far"
+            sign = 1.0 if idx % 2 == 0 else -1.0
+            return side, sign * 0.25 * s.roadway_width_ft, "MMS or Controlled Access"
+        side = s.placement_side if s.placement_side != "Both" else ("Right" if idx % 2 == 0 else "Left")
         sign = 1.0 if side == "Left" else -1.0
-        inside_edge_off = sign * (s.roadway_width_ft / 2.0 - s.checkpoint_offset_from_road_edge_ft)
-        add_checkpoint(
-            x + nx * inside_edge_off,
-            y + ny * inside_edge_off,
-            side,
-            d,
-            "Roadway Edge Zone",
-            "MMS or Controlled Access",
-        )
+        return side, sign * (s.roadway_width_ft / 2.0 + s.checkpoint_offset_from_road_edge_ft + s.safety_offset_ft), "GNSS/Total Station"
 
-    def add_outside_checkpoint(x: float, y: float, nx: float, ny: float, d: float, station_index: int) -> None:
-        side = alternating_side(station_index + 1)
-        sign = 1.0 if side == "Left" else -1.0
-        outside_off = sign * (s.roadway_width_ft / 2.0 + s.checkpoint_offset_from_road_edge_ft + s.safety_offset_ft)
-        add_checkpoint(
-            x + nx * outside_off,
-            y + ny * outside_off,
-            side,
-            d,
-            "Outside Roadway",
-            "GNSS/Total Station",
-        )
+    # Stagger zones longitudinally so different classes do not stack at identical stations.
+    for zidx, (zone, requested) in enumerate(zone_plan):
+        if requested <= 0: continue
+        # Oversample candidates, then retain well-spaced points that also satisfy GCP separation.
+        candidate_n = max(requested * 8, requested + 8)
+        step = total_len / candidate_n if candidate_n else total_len
+        phase = (zidx + 0.5) / max(len(zone_plan), 1) * step
+        candidates = [min(total_len, phase + i * step) for i in range(candidate_n + 1) if phase + i * step <= total_len]
+        selected_ds = []
+        # Farthest-along-corridor selection from candidates, seeded near evenly spaced targets.
+        targets_d = evenly_spaced_ds(requested, 0.0, total_len)
+        for tidx, target_d in enumerate(targets_d):
+            ordered = sorted(candidates, key=lambda d: abs(d - target_d))
+            placed = False
+            for d in ordered:
+                if any(abs(d - prev) < s.checkpoint_spacing_ft for prev in selected_ds): continue
+                side, off, source = zone_offset(zone, tidx)
+                if add_checkpoint_at(d, side, zone, source, off):
+                    selected_ds.append(d); candidates.remove(d); placed = True; break
+            if not placed:
+                # Relax same-zone spacing only; never relax GCP-to-checkpoint separation.
+                for d in ordered:
+                    side, off, source = zone_offset(zone, tidx)
+                    if add_checkpoint_at(d, side, zone, source, off):
+                        selected_ds.append(d); candidates.remove(d); break
 
-    def add_near_far_checkpoint(x: float, y: float, nx: float, ny: float, d: float) -> None:
-        for side, frac in [("Left Near/Far", 0.25), ("Right Near/Far", -0.25)]:
-            off = frac * s.roadway_width_ft
-            add_checkpoint(
-                x + nx * off,
-                y + ny * off,
-                side,
-                d,
-                "Roadway Near/Far Zone",
-                "MMS or Controlled Access",
-            )
+    # Hard cap and stable IDs after all zone allocations.
+    checkpoints[:] = checkpoints[:max_cp]
+    for i, cp in enumerate(checkpoints, 1): cp["id"] = f"CP_{i:03d}"
 
-    def add_checkpoint_set(interval_ft: float) -> None:
-        checkpoints.clear()
-        distribution = s.checkpoint_distribution
-        balanced = distribution.startswith("Balanced")
-
-        for station_index, (d, x, y, heading) in enumerate(points_at_interval(center_xy, interval_ft)):
-            nx, ny = -math.sin(heading), math.cos(heading)
-
-            if balanced:
-                # One point per zone per station: centerline, one road edge, and one outside-roadway point.
-                # Edge and outside sides alternate along the alignment for left/right balance.
-                add_checkpoint(x, y, "Center", d, "Roadway Center", "MMS or Controlled Access")
-                add_edge_checkpoint(x, y, nx, ny, d, station_index)
-                add_outside_checkpoint(x, y, nx, ny, d, station_index)
-                continue
-
-            if distribution == "Centerline only":
-                add_checkpoint(x, y, "Center", d, "Roadway Center", "MMS or Controlled Access")
-                continue
-
-            if distribution == "Road edges only":
-                add_edge_checkpoint(x, y, nx, ny, d, station_index)
-                continue
-
-            if distribution == "Outside roadway only":
-                add_outside_checkpoint(x, y, nx, ny, d, station_index)
-                continue
-
-            # Custom mode uses the checkboxes below.
-            if s.include_centerline_checkpoints:
-                add_checkpoint(x, y, "Center", d, "Roadway Center", "MMS or Controlled Access")
-
-            if s.include_edge_checkpoints:
-                add_edge_checkpoint(x, y, nx, ny, d, station_index)
-
-            if s.include_near_far_zone_checkpoints:
-                add_near_far_checkpoint(x, y, nx, ny, d)
-
-            if s.include_outside_checkpoints:
-                add_outside_checkpoint(x, y, nx, ny, d, station_index)
-
-    add_checkpoint_set(s.checkpoint_spacing_ft)
-
-    # Ensure at least the requested number of checkpoints when geometrically possible.
-    # This is done by decreasing the interval, while keeping 300 ft as the default/user value.
-    effective_interval = s.checkpoint_spacing_ft
-    attempts = 0
-    while len(checkpoints) < s.minimum_checkpoint_count and effective_interval > 25.0 and attempts < 12:
-        effective_interval = max(25.0, effective_interval * 0.75)
-        add_checkpoint_set(effective_interval)
-        attempts += 1
-
-    return {"gcps": gcps, "checkpoints": checkpoints, "effective_checkpoint_spacing_ft": effective_interval}
-
+    # Effective longitudinal spacings are descriptive outputs, not generation inputs.
+    g_st = sorted({float(g["station_ft"]) for g in gcps})
+    c_st = sorted(float(c["station_ft"]) for c in checkpoints)
+    g_gaps = [b-a for a,b in zip(g_st[:-1], g_st[1:])]
+    c_gaps = [b-a for a,b in zip(c_st[:-1], c_st[1:])]
+    return {
+        "gcps": gcps, "checkpoints": checkpoints,
+        "effective_gcp_spacing_ft": (sum(g_gaps)/len(g_gaps)) if g_gaps else None,
+        "effective_checkpoint_spacing_ft": (sum(c_gaps)/len(c_gaps)) if c_gaps else None,
+    }
 
 def run_checks(s: Scenario, geometry: Dict, flight: Dict, targets: Dict, fp: Dict[str, float]) -> List[Dict[str, str]]:
     checks = []
@@ -1069,10 +1036,10 @@ def run_checks(s: Scenario, geometry: Dict, flight: Dict, targets: Dict, fp: Dic
         add("GCP outside roadway", "Error", "No GCPs generated for a strategy that expects ground control.")
 
     add("GCP density", "Info", f"{gcp_metrics.get('gcp_density_per_km'):.2f} GCP/km" if gcp_metrics.get('gcp_density_per_km') is not None else "No GCP density available.")
-    if len(targets["gcps"]) < s.minimum_gcp_count and s.ground_control_strategy != "GCP-free":
-        add("Project GCP count target", "Warning", f"{len(targets['gcps'])} GCPs generated; project planning target is {s.minimum_gcp_count}. This is not an ASPRS minimum-GCP requirement.")
+    if s.ground_control_strategy == "GCP-free":
+        add("Maximum GCP count", "Info", "GCP-free strategy selected.")
     else:
-        add("Project GCP count target", "Pass" if targets["gcps"] else "Info", f"{len(targets['gcps'])} GCPs generated; planning target is {s.minimum_gcp_count}.")
+        add("Maximum GCP count", "Pass", f"{len(targets['gcps'])} GCPs generated; maximum allowed is {s.maximum_gcp_count}.")
 
     if s.gcp_pattern == "One-Sided":
         add("GCP cross-corridor geometry", "Warning", "One-sided GCP distribution provides asymmetric cross-corridor control and is retained mainly as an experimental comparison case.")
@@ -1103,10 +1070,7 @@ def run_checks(s: Scenario, geometry: Dict, flight: Dict, targets: Dict, fp: Dic
     else:
         add("Mixed checkpoint layout", "Error", "No checkpoints were generated.")
 
-    if len(targets["checkpoints"]) >= s.minimum_checkpoint_count:
-        add("Minimum checkpoint count", "Pass", f"{len(targets['checkpoints'])} checkpoints generated; project target is {s.minimum_checkpoint_count}.")
-    else:
-        add("Minimum checkpoint count", "Warning", f"Only {len(targets['checkpoints'])} checkpoints generated; project target is {s.minimum_checkpoint_count}.")
+    add("Maximum checkpoint count", "Pass", f"{len(targets['checkpoints'])} checkpoints generated; maximum allowed is {s.maximum_checkpoint_count}.")
 
     if len(targets["checkpoints"]) >= 30:
         add("ASPRS checkpoint sample size", "Pass", f"{len(targets['checkpoints'])} checkpoints generated; meets the 30-point minimum sample size used for standard horizontal/vertical accuracy assessment when applicable.")
@@ -1164,7 +1128,7 @@ def scenario_summary_dict(s: Scenario, geometry: Dict, flight: Dict, targets: Di
         "road_edge_checkpoint_count": sum(1 for cp in targets["checkpoints"] if cp.get("zone") == "Roadway Edge Zone"),
         "outside_roadway_checkpoint_count": sum(1 for cp in targets["checkpoints"] if cp.get("zone") == "Outside Roadway"),
         "checkpoint_distribution": s.checkpoint_distribution,
-        "effective_checkpoint_spacing_ft": round(targets.get("effective_checkpoint_spacing_ft", s.checkpoint_spacing_ft), 2),
+        "effective_checkpoint_spacing_ft": round(targets.get("effective_checkpoint_spacing_ft") or s.checkpoint_spacing_ft, 2),
         "estimated_image_count": len(flight["image_centers"]),
         "estimated_footprint_count": len(flight["footprints"]),
         "estimated_camera_orientation_count": len(flight.get("camera_orientations", [])),
@@ -2317,7 +2281,7 @@ def scenario_summary_dict(s: Scenario, geometry: Dict, flight: Dict, targets: Di
         "road_edge_checkpoint_count": sum(1 for cp in targets["checkpoints"] if cp.get("zone") == "Roadway Edge Zone"),
         "outside_roadway_checkpoint_count": sum(1 for cp in targets["checkpoints"] if cp.get("zone") == "Outside Roadway"),
         "checkpoint_distribution": s.checkpoint_distribution,
-        "effective_checkpoint_spacing_ft": round(targets.get("effective_checkpoint_spacing_ft", s.checkpoint_spacing_ft), 2),
+        "effective_checkpoint_spacing_ft": round(targets.get("effective_checkpoint_spacing_ft") or s.checkpoint_spacing_ft, 2),
         "estimated_image_count": len(flight["image_centers"]),
         "estimated_footprint_count": len(flight["footprints"]),
         "estimated_camera_orientation_count": len(flight.get("camera_orientations", [])),
@@ -3145,19 +3109,22 @@ with tabs[4]:
     terminal_pair_inset_ft = st.number_input("Terminal Pair Inset from Corridor Ends (ft)", min_value=0.0, value=0.0, step=10.0, disabled=(gcp_pattern != "Staggered + Terminal Pairs"))
 
     c1, c2, c3, c4 = st.columns(4)
-    gcp_spacing_ft = c1.number_input("GCP Spacing (ft)", min_value=25.0, value=300.0, step=25.0)
-    checkpoint_spacing_ft = c2.number_input("Checkpoint Spacing (ft)", min_value=25.0, value=300.0, step=25.0)
+    maximum_gcp_count = int(c1.number_input("Maximum GCP Count", min_value=0, value=10, step=1, help="Hard cap. The app distributes up to this many GCPs over the corridor."))
+    maximum_checkpoint_count = int(c2.number_input("Maximum Checkpoint Count", min_value=1, value=30, step=1, help="Hard cap. Balanced mode emphasizes roadway validation."))
     gcp_offset_from_road_edge_ft = c3.number_input("GCP Offset from Road Edge (ft)", min_value=0.0, value=25.0, step=5.0)
     checkpoint_offset_from_road_edge_ft = c4.number_input("Checkpoint Offset from Road Edge (ft)", min_value=0.0, value=25.0, step=5.0)
+
+    csp1, csp2 = st.columns(2)
+    gcp_spacing_ft = csp1.number_input("Minimum GCP Longitudinal Spacing (ft)", min_value=0.0, value=150.0, step=25.0, help="Planning separation used while distributing interior GCP stations.")
+    checkpoint_spacing_ft = csp2.number_input("Minimum Checkpoint Longitudinal Spacing (ft)", min_value=0.0, value=75.0, step=25.0, help="Preferred same-zone longitudinal separation; relaxed only if needed to reach the maximum count while preserving GCP-CP separation.")
 
     c5, c6, c7 = st.columns(3)
     safety_offset_ft = c5.number_input("Safety Offset (ft)", min_value=0.0, value=10.0, step=5.0)
     target_size_ft = c6.number_input("Target Size (ft)", min_value=0.5, value=2.0, step=0.5)
     placement_side = c7.selectbox("Placement Side", ["Both", "Left", "Right"], index=0, help="Used by bilateral/staggered GCP patterns and checkpoint placement.")
 
-    cgcpa, cgcpb = st.columns(2)
-    minimum_gcp_count = int(cgcpa.number_input("Project Target Minimum GCP Count", min_value=0, value=10, step=1, help="Project planning target only; ASPRS does not prescribe one universal minimum GCP count for UAS photogrammetry."))
-    minimum_gcp_checkpoint_separation_ft = cgcpb.number_input("Minimum GCP-to-Checkpoint Separation (ft)", min_value=0.0, value=50.0, step=10.0, help="Planning threshold used to flag checkpoints that may not be sufficiently independent from control. Not an ASPRS fixed-distance requirement.")
+    minimum_gcp_count = 0
+    minimum_gcp_checkpoint_separation_ft = st.number_input("Minimum GCP-to-Checkpoint Separation (ft)", min_value=0.0, value=75.0, step=10.0, help="Hard planning separation enforced during checkpoint placement. Not an ASPRS fixed-distance requirement.")
 
     checkpoint_distribution = st.selectbox(
         "Checkpoint Distribution",
@@ -3185,8 +3152,8 @@ with tabs[4]:
         include_outside_checkpoints = checkpoint_distribution in ["Balanced: Centerline + Road Edges + Outside", "Outside roadway only"]
         st.caption("Custom zone checkboxes are hidden because a preset distribution mode is selected.")
 
-    minimum_checkpoint_count = int(st.number_input("Minimum Total Checkpoint Count", min_value=1, value=50, step=1))
-    st.info("GCP patterns support corridor experiments including staggered/zigzag layouts, terminal pairs, bilateral pairs, one-sided controls, centerline weak-geometry cases, and GCP-free direct-georeferencing tests. Checkpoints remain independent validation points. The 30-checkpoint ASPRS sample-size check is reported separately from the project target count.")
+    minimum_checkpoint_count = 30
+    st.info("Version 3.7 uses count-driven target placement: Maximum GCP/Checkpoint Count + minimum separation. Balanced checkpoints are allocated approximately 40% roadway center, 40% roadway edge, and 20% outside roadway, with GCP-to-checkpoint separation enforced during placement.")
 
 with tabs[5]:
     st.subheader("Footprint & Coverage")
@@ -3217,6 +3184,7 @@ s = Scenario(
     iso=iso, aperture_f=aperture_f, focus_mode=focus_mode, image_format=image_format, trigger_mode=trigger_mode,
     survey_mode=survey_mode,
     gcp_spacing_ft=gcp_spacing_ft, checkpoint_spacing_ft=checkpoint_spacing_ft,
+    maximum_gcp_count=maximum_gcp_count, maximum_checkpoint_count=maximum_checkpoint_count,
     gcp_offset_from_road_edge_ft=gcp_offset_from_road_edge_ft,
     checkpoint_offset_from_road_edge_ft=checkpoint_offset_from_road_edge_ft, safety_offset_ft=safety_offset_ft,
     target_size_ft=target_size_ft, placement_side=placement_side,
