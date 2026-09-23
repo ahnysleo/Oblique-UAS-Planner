@@ -1,13 +1,13 @@
 """
 Oblique UAS Highway Mapping Experiment Planning Simulator
-Version 3.1 prototype
+Version 3.4 prototype
 
 Run:
     streamlit run app.py
 
 Purpose:
     Load a KML/KMZ centerline, generate simplified highway/corridor/ROW geometry,
-    flight lines, true ground-projected camera footprints, GCP/checkpoint layouts, constraint checks,
+    flight lines, true ground-projected camera footprints, corridor-oriented GCP/checkpoint layouts, constraint checks,
     and export KMZ/CSV/JSON planning products for Google Earth review.
 """
 
@@ -46,23 +46,23 @@ CAMERA_MODELS: Dict[str, Dict[str, Dict[str, float]]] = {
     },
     "Skydio X10": {
         "V100-L Wide": {
-            "focal_length_mm": 0.0,
-            "sensor_width_mm": 0.0,
-            "sensor_height_mm": 0.0,
+            "focal_length_mm": 7.74,
+            "sensor_width_mm": 13.1072,
+            "sensor_height_mm": 9.8304,
             "image_width_px": 8192,
             "image_height_px": 6144,
-            "hfov_deg": 93.0,
-            "vfov_deg": 70.0,
-            "resolution_mp": 50.0,
+            "hfov_deg": 80.0,
+            "vfov_deg": 65.0,
+            "resolution_mp": 50.3,
         },
         "V100-L Narrow": {
-            "focal_length_mm": 0.0,
-            "sensor_width_mm": 0.0,
-            "sensor_height_mm": 0.0,
+            "focal_length_mm": 9.88,
+            "sensor_width_mm": 7.3984,
+            "sensor_height_mm": 5.5552,
             "image_width_px": 9248,
             "image_height_px": 6944,
-            "hfov_deg": 50.0,
-            "vfov_deg": 38.0,
+            "hfov_deg": 40.0,
+            "vfov_deg": 30.0,
             "resolution_mp": 64.0,
         },
     },
@@ -97,7 +97,7 @@ class Scenario:
     image_height_px: int = 6336
     hfov_deg: float = 73.7
     vfov_deg: float = 53.1
-    oblique_look_angle_deg: float = 45.0
+    oblique_look_angle_deg: float = 35.0
 
     flight_mode: str = "Oblique + Nadir"
     flight_side: str = "Both"
@@ -110,6 +110,16 @@ class Scenario:
     cross_flight_angle_deg: float = 90.0
     forward_overlap_pct: float = 80.0
     side_overlap_pct: float = 70.0
+
+    # Version 3.3 acquisition / exposure planning fields.
+    flight_speed_mps: float = 5.0
+    exposure_mode: str = "Manual"
+    shutter_speed_s: float = 1.0 / 1000.0
+    iso: int = 100
+    aperture_f: float = 5.6
+    focus_mode: str = "Manual / Infinity"
+    image_format: str = "JPEG"
+    trigger_mode: str = "Distance-based"
 
     survey_mode: str = "Cal Expo Validation Mode"
     gcp_spacing_ft: float = 300.0
@@ -125,6 +135,17 @@ class Scenario:
     include_outside_checkpoints: bool = True
     checkpoint_distribution: str = "Balanced: Centerline + Road Edges + Outside"
     minimum_checkpoint_count: int = 50
+
+    # Version 3.2 corridor-control experiment design fields.
+    positioning_mode: str = "RTK/PPK + GCP"
+    ground_control_strategy: str = "Corridor Reference"
+    gcp_pattern: str = "Staggered + Terminal Pairs"
+    gcp_one_sided_side: str = "Left"
+    force_start_terminal_pair: bool = True
+    force_end_terminal_pair: bool = True
+    terminal_pair_inset_ft: float = 0.0
+    minimum_gcp_count: int = 4
+    minimum_gcp_checkpoint_separation_ft: float = 50.0
 
     show_footprints: bool = True
     show_image_centers: bool = True
@@ -672,6 +693,103 @@ def build_flight_plan(center_xy: List[Tuple[float, float]], s: Scenario, fp: Dic
     }
 
 
+
+def polygon_area(points: List[Tuple[float, float]]) -> float:
+    """Absolute planar polygon area in square feet."""
+    if len(points) < 3:
+        return 0.0
+    pts = points[:-1] if points[0] == points[-1] else points
+    return abs(sum(pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1] for i in range(len(pts))) / 2.0)
+
+
+def convex_hull(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Monotonic-chain convex hull; returns closed polygon when possible."""
+    pts = sorted(set(points))
+    if len(pts) <= 1:
+        return pts
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    return hull + [hull[0]] if len(hull) >= 3 else hull
+
+
+def gcp_layout_metrics(center_xy: List[Tuple[float, float]], s: Scenario, targets: Dict, geometry: Optional[Dict] = None) -> Dict[str, object]:
+    """Corridor-oriented GCP distribution metrics for experiment planning.
+
+    These are geometry/planning indicators, not ASPRS pass/fail requirements and
+    not a substitute for bundle-adjustment diagnostics or measured checkpoint RMSE.
+    """
+    gcps = targets.get("gcps", [])
+    cps = targets.get("checkpoints", [])
+    length_ft = max(polyline_length(center_xy), 1e-9)
+    length_km = length_ft * FT_TO_M / 1000.0
+    count = len(gcps)
+    stations = sorted({float(g.get("station_ft", 0.0)) for g in gcps})
+    gaps = [b - a for a, b in zip(stations[:-1], stations[1:])]
+    left = sum(1 for g in gcps if g.get("side") == "Left")
+    right = sum(1 for g in gcps if g.get("side") == "Right")
+    center = sum(1 for g in gcps if g.get("side") == "Center")
+    if left and right:
+        lr_balance = min(left, right) / max(left, right)
+    elif left == right == 0:
+        lr_balance = None
+    else:
+        lr_balance = 0.0
+    if stations:
+        longitudinal_coverage = max(0.0, min(1.0, (stations[-1] - stations[0]) / length_ft))
+    else:
+        longitudinal_coverage = 0.0
+    signed_offsets = [float(g.get("signed_offset_ft", 0.0)) for g in gcps]
+    cross_spread = (max(signed_offsets) - min(signed_offsets)) if signed_offsets else 0.0
+    cross_spread_ratio = cross_spread / max(s.roadway_width_ft, 1e-9)
+    start_pair = any(g.get("terminal") == "Start" and g.get("side") == "Left" for g in gcps) and any(g.get("terminal") == "Start" and g.get("side") == "Right" for g in gcps)
+    end_pair = any(g.get("terminal") == "End" and g.get("side") == "Left" for g in gcps) and any(g.get("terminal") == "End" and g.get("side") == "Right" for g in gcps)
+    min_cp_gcp = None
+    sep_violations = 0
+    if gcps and cps:
+        dists = [distance_to_nearest((cp["x"], cp["y"]), gcps) for cp in cps]
+        min_cp_gcp = min(dists) if dists else None
+        sep_violations = sum(1 for d in dists if d < s.minimum_gcp_checkpoint_separation_ft)
+    gdi = None
+    if count >= 3:
+        hull = convex_hull([(g["x"], g["y"]) for g in gcps])
+        hull_area = polygon_area(hull) if len(hull) >= 3 else 0.0
+        whole_poly = geometry.get("row_polygon") if geometry else corridor_polygon(center_xy, s.row_width_ft)
+        whole_area = polygon_area(whole_poly)
+        if whole_area > 0:
+            gdi = (hull_area / whole_area) * count
+    return {
+        "gcp_count": count,
+        "gcp_density_per_km": (count / length_km) if length_km > 0 else None,
+        "unique_gcp_station_count": len(stations),
+        "mean_longitudinal_gap_ft": (sum(gaps) / len(gaps)) if gaps else None,
+        "max_longitudinal_gap_ft": max(gaps) if gaps else None,
+        "left_gcp_count": left,
+        "right_gcp_count": right,
+        "center_gcp_count": center,
+        "left_right_balance_ratio": lr_balance,
+        "longitudinal_coverage_ratio": longitudinal_coverage,
+        "cross_corridor_spread_ft": cross_spread,
+        "cross_corridor_spread_ratio": cross_spread_ratio,
+        "start_terminal_pair_present": start_pair,
+        "end_terminal_pair_present": end_pair,
+        "minimum_checkpoint_to_gcp_distance_ft": min_cp_gcp,
+        "checkpoint_gcp_separation_violations": sep_violations,
+        "gdi_supplemental": gdi,
+        "gdi_note": "Supplemental 2D convex-hull indicator; interpret cautiously for long narrow corridors.",
+    }
+
+
 def build_targets(center_xy: List[Tuple[float, float]], s: Scenario) -> Dict:
     """Generate GCPs and checkpoints.
 
@@ -705,20 +823,75 @@ def build_targets(center_xy: List[Tuple[float, float]], s: Scenario) -> Dict:
             "source": source,
         })
 
-    for d, x, y, heading in points_at_interval(center_xy, s.gcp_spacing_ft):
+    def add_gcp(d: float, x: float, y: float, heading: float, side: str, terminal: str = "Interior") -> None:
         nx, ny = -math.sin(heading), math.cos(heading)
-        for side in sides:
+        if side == "Center":
+            signed_off = 0.0
+            zone = "Roadway Center"
+            source = "Experimental Survey Control"
+        else:
             sign = 1.0 if side == "Left" else -1.0
-            off = sign * (s.roadway_width_ft / 2.0 + s.gcp_offset_from_road_edge_ft + s.safety_offset_ft)
-            gcps.append({
-                "id": f"GCP_{len(gcps)+1:03d}",
-                "x": x + nx * off,
-                "y": y + ny * off,
-                "side": side,
-                "station_ft": d,
-                "zone": "Outside Roadway",
-                "source": "Survey Control",
-            })
+            signed_off = sign * (s.roadway_width_ft / 2.0 + s.gcp_offset_from_road_edge_ft + s.safety_offset_ft)
+            zone = "Outside Roadway"
+            source = "Survey Control"
+        gcps.append({
+            "id": f"GCP_{len(gcps)+1:03d}",
+            "x": x + nx * signed_off,
+            "y": y + ny * signed_off,
+            "side": side,
+            "station_ft": d,
+            "signed_offset_ft": signed_off,
+            "terminal": terminal,
+            "pattern": s.gcp_pattern,
+            "zone": zone,
+            "source": source,
+        })
+
+    # GCP-free is a valid research configuration when direct georeferencing is being tested.
+    if s.ground_control_strategy != "GCP-free":
+        total_len = polyline_length(center_xy)
+        inset = max(0.0, min(s.terminal_pair_inset_ft, total_len / 2.0))
+
+        # Terminal pairs are explicitly controlled for the staggered + terminal pattern.
+        terminal_ds = set()
+        if s.gcp_pattern == "Staggered + Terminal Pairs":
+            if s.force_start_terminal_pair:
+                d = inset
+                x, y, h = interpolate_polyline(center_xy, d)
+                add_gcp(d, x, y, h, "Left", "Start")
+                add_gcp(d, x, y, h, "Right", "Start")
+                terminal_ds.add(round(d, 6))
+            if s.force_end_terminal_pair:
+                d = max(0.0, total_len - inset)
+                if round(d, 6) not in terminal_ds:
+                    x, y, h = interpolate_polyline(center_xy, d)
+                    add_gcp(d, x, y, h, "Left", "End")
+                    add_gcp(d, x, y, h, "Right", "End")
+                    terminal_ds.add(round(d, 6))
+
+        stations = points_at_interval(center_xy, s.gcp_spacing_ft)
+        interior_index = 0
+        for d, x, y, heading in stations:
+            # Avoid duplicating terminal stations already created as pairs.
+            if round(d, 6) in terminal_ds:
+                continue
+            pattern = s.gcp_pattern
+            if pattern == "Bilateral Pairs":
+                active_sides = ["Left", "Right"] if s.placement_side == "Both" else [s.placement_side]
+            elif pattern in ("Staggered", "Staggered + Terminal Pairs"):
+                if s.placement_side == "Both":
+                    active_sides = ["Left" if interior_index % 2 == 0 else "Right"]
+                else:
+                    active_sides = [s.placement_side]
+            elif pattern == "One-Sided":
+                active_sides = [s.gcp_one_sided_side]
+            elif pattern == "Centerline":
+                active_sides = ["Center"]
+            else:
+                active_sides = ["Left", "Right"] if s.placement_side == "Both" else [s.placement_side]
+            for side in active_sides:
+                add_gcp(d, x, y, heading, side, "Interior")
+            interior_index += 1
 
     def alternating_side(station_index: int) -> str:
         if s.placement_side != "Both":
@@ -852,7 +1025,9 @@ def run_checks(s: Scenario, geometry: Dict, flight: Dict, targets: Dict, fp: Dic
         add("Far-side coverage", "Info", "Nadir-only scenario; far-side oblique coverage is not applicable.")
 
     gcp_reach = s.offset_from_road_edge_ft + s.gcp_offset_from_road_edge_ft + s.safety_offset_ft
-    if "Oblique" in s.flight_mode and fp["oblique_width_ft"] / 2.0 >= gcp_reach:
+    if s.ground_control_strategy == "GCP-free":
+        add("GCP visibility", "Info", "GCP-free research configuration selected; GCP visibility is not applicable.")
+    elif "Oblique" in s.flight_mode and fp["oblique_width_ft"] / 2.0 >= gcp_reach:
         add("GCP visibility", "Pass", "Current simplified footprint can likely see outside-roadway GCPs.")
     else:
         add("GCP visibility", "Warning", "GCP visibility may be insufficient. Increase altitude, reduce offset, or add nadir/cross coverage.")
@@ -867,10 +1042,53 @@ def run_checks(s: Scenario, geometry: Dict, flight: Dict, targets: Dict, fp: Dic
     else:
         add("Side overlap", "Warning", "Side overlap is below 60%; consider increasing side overlap or adding more lines.")
 
-    if targets["gcps"]:
-        add("GCP outside roadway", "Pass", f"{len(targets['gcps'])} GCPs generated outside the simulated roadway.")
+    acq = acquisition_metrics(s, fp)
+    worst_blur = acq.get("worst_case_motion_blur_px")
+    if isinstance(worst_blur, (int, float)):
+        if worst_blur <= 0.5:
+            add("Motion blur screening", "Pass", f"Estimated worst-case image motion is {worst_blur:.2f} pixel at {s.flight_speed_mps:g} m/s and {acq['shutter_display']}.")
+        elif worst_blur <= 1.0:
+            add("Motion blur screening", "Warning", f"Estimated worst-case image motion is {worst_blur:.2f} pixel. Consider a faster shutter or slower flight speed for high-accuracy mapping.")
+        else:
+            add("Motion blur screening", "Warning", f"Estimated worst-case image motion is {worst_blur:.2f} pixels. Use a faster shutter and/or slower flight speed.")
+    if acq.get("trigger_interval_s") is not None and acq["trigger_interval_s"] < 0.5:
+        add("Camera trigger interval", "Warning", f"Calculated trigger interval is {acq['trigger_interval_s']:.2f} s. Verify the selected payload can sustain this capture rate at full resolution.")
     else:
-        add("GCP outside roadway", "Error", "No GCPs generated.")
+        add("Camera trigger interval", "Info", "Calculated trigger interval is a planning value; verify payload-specific sustained capture rate in the manufacturer controller/software.")
+
+    gcp_metrics = gcp_layout_metrics(geometry["centerline"], s, targets, geometry)
+    if targets["gcps"]:
+        if s.gcp_pattern == "Centerline":
+            add("GCP roadway placement", "Warning", "Centerline GCP pattern is an experimental weak-geometry case; controls are not outside the roadway.")
+        else:
+            outside_count = sum(1 for g in targets["gcps"] if g.get("zone") == "Outside Roadway")
+            add("GCP outside roadway", "Pass" if outside_count == len(targets["gcps"]) else "Warning", f"{outside_count} of {len(targets['gcps'])} GCPs are outside the simulated roadway.")
+    elif s.ground_control_strategy == "GCP-free":
+        add("Ground control strategy", "Info", f"GCP-free research configuration selected with {s.positioning_mode}. Final acceptability must be verified with independent checkpoints.")
+    else:
+        add("GCP outside roadway", "Error", "No GCPs generated for a strategy that expects ground control.")
+
+    add("GCP density", "Info", f"{gcp_metrics.get('gcp_density_per_km'):.2f} GCP/km" if gcp_metrics.get('gcp_density_per_km') is not None else "No GCP density available.")
+    if len(targets["gcps"]) < s.minimum_gcp_count and s.ground_control_strategy != "GCP-free":
+        add("Project GCP count target", "Warning", f"{len(targets['gcps'])} GCPs generated; project planning target is {s.minimum_gcp_count}. This is not an ASPRS minimum-GCP requirement.")
+    else:
+        add("Project GCP count target", "Pass" if targets["gcps"] else "Info", f"{len(targets['gcps'])} GCPs generated; planning target is {s.minimum_gcp_count}.")
+
+    if s.gcp_pattern == "One-Sided":
+        add("GCP cross-corridor geometry", "Warning", "One-sided GCP distribution provides asymmetric cross-corridor control and is retained mainly as an experimental comparison case.")
+    elif s.gcp_pattern == "Centerline":
+        add("GCP cross-corridor geometry", "Warning", "Centerline/collinear GCP distribution provides little cross-track control and is retained mainly as an experimental comparison case.")
+    elif targets["gcps"]:
+        add("GCP cross-corridor geometry", "Pass", f"Left/right counts: {gcp_metrics['left_gcp_count']} / {gcp_metrics['right_gcp_count']}; spread ratio: {gcp_metrics['cross_corridor_spread_ratio']:.2f}.")
+
+    if s.gcp_pattern == "Staggered + Terminal Pairs":
+        terminal_ok = ((not s.force_start_terminal_pair or gcp_metrics['start_terminal_pair_present']) and (not s.force_end_terminal_pair or gcp_metrics['end_terminal_pair_present']))
+        add("Terminal GCP pairs", "Pass" if terminal_ok else "Warning", f"Start pair: {gcp_metrics['start_terminal_pair_present']}; End pair: {gcp_metrics['end_terminal_pair_present']}.")
+
+    if gcp_metrics.get("checkpoint_gcp_separation_violations", 0) > 0:
+        add("GCP-checkpoint independence spacing", "Warning", f"{gcp_metrics['checkpoint_gcp_separation_violations']} checkpoint(s) are within {s.minimum_gcp_checkpoint_separation_ft:g} ft of a GCP. Review independence and placement.")
+    elif targets["gcps"] and targets["checkpoints"]:
+        add("GCP-checkpoint independence spacing", "Pass", f"No checkpoint is within the planning separation threshold of {s.minimum_gcp_checkpoint_separation_ft:g} ft.")
 
     center_cp_count = sum(1 for cp in targets["checkpoints"] if cp.get("zone") == "Roadway Center")
     edge_cp_count = sum(1 for cp in targets["checkpoints"] if cp.get("zone") == "Roadway Edge Zone")
@@ -886,9 +1104,14 @@ def run_checks(s: Scenario, geometry: Dict, flight: Dict, targets: Dict, fp: Dic
         add("Mixed checkpoint layout", "Error", "No checkpoints were generated.")
 
     if len(targets["checkpoints"]) >= s.minimum_checkpoint_count:
-        add("Minimum checkpoint count", "Pass", f"{len(targets['checkpoints'])} checkpoints generated; minimum target is {s.minimum_checkpoint_count}.")
+        add("Minimum checkpoint count", "Pass", f"{len(targets['checkpoints'])} checkpoints generated; project target is {s.minimum_checkpoint_count}.")
     else:
-        add("Minimum checkpoint count", "Warning", f"Only {len(targets['checkpoints'])} checkpoints generated; target is {s.minimum_checkpoint_count}.")
+        add("Minimum checkpoint count", "Warning", f"Only {len(targets['checkpoints'])} checkpoints generated; project target is {s.minimum_checkpoint_count}.")
+
+    if len(targets["checkpoints"]) >= 30:
+        add("ASPRS checkpoint sample size", "Pass", f"{len(targets['checkpoints'])} checkpoints generated; meets the 30-point minimum sample size used for standard horizontal/vertical accuracy assessment when applicable.")
+    else:
+        add("ASPRS checkpoint sample size", "Warning", f"Only {len(targets['checkpoints'])} checkpoints generated. ASPRS accuracy assessment normally uses at least 30 well-distributed checkpoints for the applicable component, or requires special reporting when fewer are used.")
 
     if "Nadir" in s.flight_mode:
         add("Nadir reference included", "Info", "Nadir reference line is included for baseline comparison.")
@@ -1041,6 +1264,207 @@ def build_kmz_bytes(s: Scenario, center_lonlat: List[Tuple[float, float]], geome
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
+
+# -----------------------------------------------------------------------------
+# Version 3.3 acquisition settings, motion blur, and mission-transfer exports.
+# -----------------------------------------------------------------------------
+def acquisition_metrics(s: Scenario, fp: Dict[str, float]) -> Dict[str, object]:
+    """Compute trigger spacing/interval and simple exposure-motion screening.
+
+    These values are planning aids. They do not model platform vibration, rolling
+    shutter, wind gusts, autofocus behavior, or actual exposure metering.
+    """
+    speed = max(float(s.flight_speed_mps), 0.01)
+    shutter_s = max(float(s.shutter_speed_s), 1e-6)
+
+    # The flight planner uses the oblique along-track footprint when oblique imagery
+    # is present and the nadir along-track footprint otherwise.
+    if "Oblique" in s.flight_mode:
+        along_track_ft = float(fp.get("oblique_length_ft", 0.0))
+    else:
+        along_track_ft = float(fp.get("nadir_length_ft", 0.0))
+    trigger_distance_ft = max(0.0, along_track_ft * (1.0 - s.forward_overlap_pct / 100.0))
+    trigger_distance_m = trigger_distance_ft * FT_TO_M
+    trigger_interval_s = trigger_distance_m / speed if speed > 0 else None
+
+    ground_blur_m = speed * shutter_s
+    gsd_names = {
+        "nadir": fp.get("asprs_nadir_gsdc_cm", fp.get("approx_nadir_gsd_cm")),
+        "oblique_near": fp.get("asprs_oblique_near_gsdc_cm"),
+        "oblique_mid": fp.get("asprs_oblique_mid_gsdc_cm"),
+        "oblique_far": fp.get("asprs_oblique_far_gsdc_cm"),
+    }
+    blur_px = {}
+    for name, gsd_cm in gsd_names.items():
+        if gsd_cm is None or float(gsd_cm) <= 0:
+            blur_px[name] = None
+        else:
+            blur_px[name] = ground_blur_m / (float(gsd_cm) / 100.0)
+    finite_blurs = [v for v in blur_px.values() if isinstance(v, (int, float)) and math.isfinite(v)]
+    worst_blur_px = max(finite_blurs) if finite_blurs else None
+    if worst_blur_px is None:
+        blur_status = "Unknown"
+    elif worst_blur_px <= 0.5:
+        blur_status = "Good"
+    elif worst_blur_px <= 1.0:
+        blur_status = "Moderate"
+    else:
+        blur_status = "High"
+
+    return {
+        "flight_speed_mps": speed,
+        "shutter_speed_s": shutter_s,
+        "shutter_display": f"1/{round(1.0 / shutter_s):d} s" if shutter_s > 0 else "N/A",
+        "trigger_distance_ft": trigger_distance_ft,
+        "trigger_distance_m": trigger_distance_m,
+        "trigger_interval_s": trigger_interval_s,
+        "ground_motion_during_exposure_m": ground_blur_m,
+        "ground_motion_during_exposure_mm": ground_blur_m * 1000.0,
+        "blur_px_nadir": blur_px.get("nadir"),
+        "blur_px_oblique_near": blur_px.get("oblique_near"),
+        "blur_px_oblique_mid": blur_px.get("oblique_mid"),
+        "blur_px_oblique_far": blur_px.get("oblique_far"),
+        "worst_case_motion_blur_px": worst_blur_px,
+        "motion_blur_status": blur_status,
+    }
+
+
+def _heading_deg(rad: float) -> float:
+    return (math.degrees(rad) + 360.0) % 360.0
+
+
+def build_mission_waypoint_df(s: Scenario, flight: Dict, lon0: float, lat0: float) -> pd.DataFrame:
+    """Create a vendor-neutral waypoint/image-station transfer table.
+
+    Gimbal pitch convention in this table: 0 deg = horizon; -90 deg = nadir.
+    The simulator's oblique look angle is measured from vertical, so an off-nadir
+    angle beta maps to pitch = -(90-beta).
+    """
+    rows = []
+    for idx, im in enumerate(flight.get("image_centers", []), start=1):
+        lon, lat = xy_to_lonlat(im["x"], im["y"], lon0, lat0)
+        heading = _heading_deg(im.get("heading", 0.0))
+        name = str(im.get("line", ""))
+        image_type = str(im.get("type", ""))
+        if image_type == "oblique":
+            pitch = -(90.0 - float(s.oblique_look_angle_deg))
+            if "Left" in name:
+                # Left-side flight line looks toward the road on the right side.
+                yaw = (heading - 90.0) % 360.0
+                look_side = "Right toward corridor"
+            elif "Right" in name:
+                yaw = (heading + 90.0) % 360.0
+                look_side = "Left toward corridor"
+            else:
+                yaw = heading
+                look_side = "Oblique"
+        else:
+            pitch = -90.0
+            yaw = heading
+            look_side = "Nadir"
+        rows.append({
+            "sequence": idx,
+            "image_id": im.get("id", idx),
+            "flight_line": name,
+            "image_type": image_type,
+            "latitude_deg": lat,
+            "longitude_deg": lon,
+            "altitude_agl_ft": s.altitude_ft,
+            "altitude_agl_m": s.altitude_ft * FT_TO_M,
+            "flight_heading_deg": round(heading, 3),
+            "gimbal_yaw_deg": round(yaw, 3),
+            "gimbal_pitch_deg": round(pitch, 3),
+            "look_side": look_side,
+            "flight_speed_mps": s.flight_speed_mps,
+            "trigger_mode": s.trigger_mode,
+            "shutter_speed_s": s.shutter_speed_s,
+            "iso": s.iso,
+            "aperture_f": s.aperture_f,
+            "focus_mode": s.focus_mode,
+            "image_format": s.image_format,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_astro_plan_bytes(s: Scenario, flight: Dict, lon0: float, lat0: float) -> bytes:
+    """Build a basic PX4/QGroundControl-style .plan route for Astro/AMC review.
+
+    Freefly documents that Auterion Mission Control can import/export .plan files.
+    This exporter writes simple relative-altitude waypoint items using the standard
+    QGC Plan JSON structure. Camera exposure values are also exported separately
+    in the acquisition-settings JSON because payload-specific camera commands may
+    vary by Astro/AMC software version and should be verified in AMC before flight.
+    """
+    wp = build_mission_waypoint_df(s, flight, lon0, lat0)
+    items = []
+    for i, r in wp.iterrows():
+        alt_m = float(r["altitude_agl_m"])
+        items.append({
+            "AMSLAltAboveTerrain": None,
+            "Altitude": alt_m,
+            "AltitudeMode": 1,
+            "autoContinue": True,
+            "command": 16,
+            "doJumpId": int(i) + 1,
+            "frame": 3,
+            "params": [0, 0, 0, float("nan"), float(r["latitude_deg"]), float(r["longitude_deg"]), alt_m],
+            "type": "SimpleItem",
+        })
+    # JSON does not support NaN in strict mode. Replace the yaw placeholder with null.
+    for item in items:
+        item["params"][3] = None
+    if not wp.empty:
+        home_lat = float(wp.iloc[0]["latitude_deg"])
+        home_lon = float(wp.iloc[0]["longitude_deg"])
+    else:
+        home_lat = lat0
+        home_lon = lon0
+    plan = {
+        "fileType": "Plan",
+        "geoFence": {"circles": [], "polygons": [], "version": 2},
+        "groundStation": "QGroundControl",
+        "mission": {
+            "cruiseSpeed": float(s.flight_speed_mps),
+            "firmwareType": 12,
+            "globalPlanAltitudeMode": 1,
+            "hoverSpeed": float(s.flight_speed_mps),
+            "items": items,
+            "plannedHomePosition": [home_lat, home_lon, 0],
+            "vehicleType": 2,
+            "version": 2,
+        },
+        "rallyPoints": {"points": [], "version": 2},
+        "version": 1,
+    }
+    return json.dumps(plan, indent=2, allow_nan=False).encode("utf-8")
+
+
+def build_acquisition_settings_bytes(s: Scenario, fp: Dict[str, float]) -> bytes:
+    metrics = acquisition_metrics(s, fp)
+    payload = {
+        "platform": s.platform,
+        "camera": s.camera,
+        "oblique_look_angle_from_vertical_deg": s.oblique_look_angle_deg,
+        "gimbal_pitch_equivalent_deg": -(90.0 - s.oblique_look_angle_deg),
+        "flight_speed_mps": s.flight_speed_mps,
+        "exposure_mode": s.exposure_mode,
+        "shutter_speed_s": s.shutter_speed_s,
+        "iso": s.iso,
+        "aperture_f": s.aperture_f,
+        "focus_mode": s.focus_mode,
+        "image_format": s.image_format,
+        "trigger_mode": s.trigger_mode,
+        "forward_overlap_pct": s.forward_overlap_pct,
+        "side_overlap_pct": s.side_overlap_pct,
+        "derived": metrics,
+        "note": "Verify all payload-specific settings and mission behavior in the manufacturer's controller software before flight.",
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def build_skydio_transfer_note_bytes(s: Scenario) -> bytes:
+    txt = f"""Skydio X10 mission transfer note\n\nScenario: {s.scenario_name}\nCamera: {s.camera}\n\nThe simulator exports a waypoint/image-station CSV and KML/KMZ planning geometry for transfer/review.\nSkydio's current documentation states that native .mission import is supported only for .mission files created by Skydio Map Capture/3D Scan.\nTherefore this simulator does not fabricate a proprietary .mission file. Recreate/verify the mission in Skydio Map Capture or Waypoint Mission using the exported geometry and acquisition settings.\n"""
+    return txt.encode("utf-8")
 
 
 # -----------------------------------------------------------------------------
@@ -1372,9 +1796,9 @@ def make_scenario_comparison_df(saved_scenarios: List[Dict[str, object]], curren
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     preferred = [
-        "scenario_name", "altitude_ft", "offset_from_road_edge_ft", "oblique_look_angle_deg",
-        "flight_mode", "flight_side", "forward_overlap_pct", "side_overlap_pct",
-        "estimated_image_count", "gcp_count", "checkpoint_count",
+        "scenario_name", "platform", "camera", "altitude_ft", "offset_from_road_edge_ft", "oblique_look_angle_deg",
+        "flight_mode", "flight_side", "cross_flight", "positioning_mode", "ground_control_strategy", "gcp_pattern",
+        "forward_overlap_pct", "side_overlap_pct", "estimated_image_count", "gcp_count", "gcp_density_per_km", "checkpoint_count",
         "mean_rmseh_cm", "mean_rmsev_cm", "overall_score", "preflight_status", "status",
     ]
     cols = [c for c in preferred if c in df.columns]
@@ -1578,7 +2002,8 @@ def build_preflight_pdf_report(
 
     # 10. GCP Analysis
     heading(10, "GCP Analysis")
-    gcp_rows = [["Metric", "Value"], ["GCP count", str(len(targets.get("gcps", [])))], ["GCP spacing", f"{s.gcp_spacing_ft:g} ft"], ["GCP offset from road edge", f"{s.gcp_offset_from_road_edge_ft:g} ft"], ["GCP source", "Survey Control / GNSS / Total Station"]]
+    gcp_m = gcp_layout_metrics(geometry["centerline"], s, targets, geometry)
+    gcp_rows = [["Metric", "Value"], ["Positioning mode", s.positioning_mode], ["Ground-control strategy", s.ground_control_strategy], ["GCP pattern", s.gcp_pattern], ["GCP count", str(len(targets.get("gcps", [])))], ["GCP spacing", f"{s.gcp_spacing_ft:g} ft"], ["GCP density", "N/A" if gcp_m.get("gcp_density_per_km") is None else f"{gcp_m['gcp_density_per_km']:.2f} GCP/km"], ["GCP offset from road edge", f"{s.gcp_offset_from_road_edge_ft:g} ft"], ["GCP source", "Survey Control / GNSS / Total Station"]]
     if not acc_df.empty and "nearest_gcp_ft" in acc_df:
         gcp_rows += [["Nearest GCP distance: min / mean / max", f"{acc_df['nearest_gcp_ft'].min():.1f} / {acc_df['nearest_gcp_ft'].mean():.1f} / {acc_df['nearest_gcp_ft'].max():.1f} ft"]]
     simple_table(gcp_rows)
@@ -1840,6 +2265,8 @@ def asprs_metadata_dict(s: Scenario, centerline_source: str, fp: Dict[str, float
 
 def scenario_summary_dict(s: Scenario, geometry: Dict, flight: Dict, targets: Dict, checks: List[Dict], fp: Dict[str, float]) -> Dict:
     overlap = compute_asprs_overlap_metrics(s, flight, fp)
+    gcp_metrics = gcp_layout_metrics(geometry["centerline"], s, targets, geometry)
+    acq = acquisition_metrics(s, fp)
     return {
         "scenario_name": s.scenario_name,
         "project_name": s.project_name,
@@ -1856,8 +2283,35 @@ def scenario_summary_dict(s: Scenario, geometry: Dict, flight: Dict, targets: Di
         "asprs_min_forward_overlap_pct": overlap["summary"].get("min_forward_overlap_pct"),
         "asprs_side_overlap_pct": overlap["summary"].get("side_overlap_pct_estimated"),
         "side_overlap_pct_input": s.side_overlap_pct,
+        "flight_speed_mps": s.flight_speed_mps,
+        "exposure_mode": s.exposure_mode,
+        "shutter_speed": acq.get("shutter_display"),
+        "iso": s.iso,
+        "aperture_f": s.aperture_f,
+        "focus_mode": s.focus_mode,
+        "image_format": s.image_format,
+        "trigger_mode": s.trigger_mode,
+        "trigger_distance_m": round(acq.get("trigger_distance_m", 0.0), 3),
+        "trigger_interval_s": None if acq.get("trigger_interval_s") is None else round(acq["trigger_interval_s"], 3),
+        "worst_case_motion_blur_px": None if acq.get("worst_case_motion_blur_px") is None else round(acq["worst_case_motion_blur_px"], 3),
+        "motion_blur_status": acq.get("motion_blur_status"),
         "path_length_ft": round(geometry["length_ft"], 2),
         "gcp_count": len(targets["gcps"]),
+        "positioning_mode": s.positioning_mode,
+        "ground_control_strategy": s.ground_control_strategy,
+        "gcp_pattern": s.gcp_pattern,
+        "gcp_density_per_km": None if gcp_metrics.get("gcp_density_per_km") is None else round(gcp_metrics["gcp_density_per_km"], 3),
+        "gcp_mean_gap_ft": None if gcp_metrics.get("mean_longitudinal_gap_ft") is None else round(gcp_metrics["mean_longitudinal_gap_ft"], 1),
+        "gcp_max_gap_ft": None if gcp_metrics.get("max_longitudinal_gap_ft") is None else round(gcp_metrics["max_longitudinal_gap_ft"], 1),
+        "gcp_left_count": gcp_metrics.get("left_gcp_count"),
+        "gcp_right_count": gcp_metrics.get("right_gcp_count"),
+        "gcp_longitudinal_coverage_ratio": round(gcp_metrics.get("longitudinal_coverage_ratio", 0.0), 3),
+        "gcp_cross_corridor_spread_ratio": round(gcp_metrics.get("cross_corridor_spread_ratio", 0.0), 3),
+        "gcp_start_terminal_pair": gcp_metrics.get("start_terminal_pair_present"),
+        "gcp_end_terminal_pair": gcp_metrics.get("end_terminal_pair_present"),
+        "gcp_gdi_supplemental": None if gcp_metrics.get("gdi_supplemental") is None else round(gcp_metrics["gdi_supplemental"], 3),
+        "minimum_cp_to_gcp_distance_ft": None if gcp_metrics.get("minimum_checkpoint_to_gcp_distance_ft") is None else round(gcp_metrics["minimum_checkpoint_to_gcp_distance_ft"], 1),
+        "checkpoint_gcp_separation_violations": gcp_metrics.get("checkpoint_gcp_separation_violations"),
         "checkpoint_count": len(targets["checkpoints"]),
         "centerline_checkpoint_count": sum(1 for cp in targets["checkpoints"] if cp.get("zone") == "Roadway Center"),
         "road_edge_checkpoint_count": sum(1 for cp in targets["checkpoints"] if cp.get("zone") == "Roadway Edge Zone"),
@@ -1993,9 +2447,23 @@ def build_full_html_report(
     parts.append(section(7, "Viewing Geometry Analysis", ("<div class='scroll'>" + df_html(acc_df[["checkpoint_id","zone","image_count","view_direction_count","view_directions","warnings"]] if not acc_df.empty else acc_df) + "</div>")))
     parts.append(section(8, "ASPRS GSD Analysis", "<div class='scroll'>" + df_html(gsd_table) + "</div>" + f"<img src='data:image/png;base64,{b64_png(make_metric_histogram_png(acc_df,'local_gsd_cm','Local GSD Distribution','Local GSD (cm)'))}'>"))
     parts.append(section(9, "Base-to-Height Ratio Analysis", f"<img src='data:image/png;base64,{b64_png(make_metric_histogram_png(acc_df,'bh_ratio','B/H Ratio Distribution','B/H Ratio'))}'>" + (kv_html({"Min B/H": acc_df['bh_ratio'].min(), "Mean B/H": acc_df['bh_ratio'].mean(), "Max B/H": acc_df['bh_ratio'].max()}) if not acc_df.empty else "")))
+    gcp_metrics_report = gcp_layout_metrics(geometry["centerline"], s, targets, geometry)
     parts.append(section(10, "GCP Analysis", kv_html({
-        "GCP count": len(targets.get("gcps", [])), "GCP spacing": f"{s.gcp_spacing_ft:g} ft",
-        "GCP offset from road edge": f"{s.gcp_offset_from_road_edge_ft:g} ft",
+        "Positioning mode": s.positioning_mode,
+        "Ground-control strategy": s.ground_control_strategy,
+        "GCP pattern": s.gcp_pattern,
+        "GCP count": len(targets.get("gcps", [])),
+        "Nominal GCP spacing": f"{s.gcp_spacing_ft:g} ft",
+        "GCP density": None if gcp_metrics_report.get("gcp_density_per_km") is None else f"{gcp_metrics_report['gcp_density_per_km']:.2f} GCP/km",
+        "Mean / max longitudinal gap": None if gcp_metrics_report.get("mean_longitudinal_gap_ft") is None else f"{gcp_metrics_report['mean_longitudinal_gap_ft']:.1f} / {gcp_metrics_report['max_longitudinal_gap_ft']:.1f} ft",
+        "Left / right / center GCPs": f"{gcp_metrics_report['left_gcp_count']} / {gcp_metrics_report['right_gcp_count']} / {gcp_metrics_report['center_gcp_count']}",
+        "Longitudinal coverage ratio": f"{gcp_metrics_report['longitudinal_coverage_ratio']:.3f}",
+        "Cross-corridor spread ratio": f"{gcp_metrics_report['cross_corridor_spread_ratio']:.3f}",
+        "Start / end terminal pair": f"{gcp_metrics_report['start_terminal_pair_present']} / {gcp_metrics_report['end_terminal_pair_present']}",
+        "Minimum CP-to-GCP distance": None if gcp_metrics_report.get("minimum_checkpoint_to_gcp_distance_ft") is None else f"{gcp_metrics_report['minimum_checkpoint_to_gcp_distance_ft']:.1f} ft",
+        "CP-GCP separation violations": gcp_metrics_report.get("checkpoint_gcp_separation_violations"),
+        "Supplemental GDI": None if gcp_metrics_report.get("gdi_supplemental") is None else f"{gcp_metrics_report['gdi_supplemental']:.3f}",
+        "GDI interpretation note": gcp_metrics_report.get("gdi_note"),
         "Expected outside-roadway source": "GNSS / Total Station",
         "Nearest GCP distance mean": None if acc_df.empty else f"{acc_df['nearest_gcp_ft'].mean():.1f} ft"
     })))
@@ -2072,12 +2540,469 @@ def build_preflight_pdf_report(
     doc.build(story)
     return buf.getvalue()
 
+
+# -----------------------------------------------------------------------------
+# Version 3.4 batch scenario analysis.
+# -----------------------------------------------------------------------------
+def _dedupe_batch_rows(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Remove exact duplicate experiment settings while preserving the first name."""
+    out = []
+    seen = set()
+    ignore = {"scenario_name", "experiment_group"}
+    for row in rows:
+        sig = tuple(sorted((k, str(v)) for k, v in row.items() if k not in ignore))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(dict(row))
+    return out
+
+
+def pair_cross_flight_rows(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Create matched Cross Flight OFF/ON versions of every base scenario.
+
+    The paired names use _XOFF and _XON suffixes so the batch report can compute
+    direct cross-flight deltas while all other scenario inputs remain identical.
+    """
+    paired = []
+    for row in rows:
+        base = dict(row)
+        raw_name = str(base.get("scenario_name", "Scenario"))
+        # Avoid stacking suffixes if a user reuses an already-paired table.
+        for suffix in ("_XOFF", "_XON"):
+            if raw_name.endswith(suffix):
+                raw_name = raw_name[:-len(suffix)]
+        off = dict(base)
+        off.update({"scenario_name": raw_name + "_XOFF", "cross_flight": False, "cross_flight_type": "None"})
+        on = dict(base)
+        on.update({"scenario_name": raw_name + "_XON", "cross_flight": True, "cross_flight_type": "Single"})
+        paired.extend([off, on])
+    return paired
+
+def expand_side_cross_rows(rows: List[Dict[str, object]], one_side: str = "Left") -> List[Dict[str, object]]:
+    """Expand each base scenario into a 2 x 2 flight-geometry factorial.
+
+    Variants:
+      1) one-side oblique, Cross Flight OFF
+      2) one-side oblique, Cross Flight ON
+      3) both-side oblique, Cross Flight OFF
+      4) both-side oblique, Cross Flight ON
+
+    The one-side direction is user-selectable (Left or Right). All non-side/non-cross
+    settings are held identical so main effects and interaction can be screened.
+    """
+    one_side = "Right" if str(one_side).strip().lower() == "right" else "Left"
+    expanded: List[Dict[str, object]] = []
+    for row in rows:
+        base = dict(row)
+        raw_name = str(base.get("scenario_name", "Scenario"))
+        # Strip our own expansion suffixes if an already-expanded table is reused.
+        raw_name = re.sub(r"_(?:ONE_(?:LEFT|RIGHT)|BOTH)_X(?:OFF|ON)$", "", raw_name, flags=re.IGNORECASE)
+        variants = [
+            (one_side, False, "ONE_" + one_side.upper() + "_XOFF"),
+            (one_side, True,  "ONE_" + one_side.upper() + "_XON"),
+            ("Both", False, "BOTH_XOFF"),
+            ("Both", True,  "BOTH_XON"),
+        ]
+        for side, cross_on, suffix in variants:
+            v = dict(base)
+            v.update({
+                "scenario_name": f"{raw_name}_{suffix}",
+                "flight_side": side,
+                "cross_flight": cross_on,
+                "cross_flight_type": "Single" if cross_on else "None",
+            })
+            expanded.append(v)
+    return expanded
+
+
+def batch_template_rows(template_name: str) -> List[Dict[str, object]]:
+    """Return research-oriented *base* scenario rows.
+
+    Cross-flight pairing is applied separately in the Batch Analysis tab so every
+    base scenario can automatically be evaluated with Cross Flight OFF and ON.
+    Batch scenarios inherit site, checkpoint, acquisition, and other settings from
+    the current GUI scenario unless explicitly overridden here.
+    """
+    baseline = {
+        "platform": "Freefly Astro",
+        "camera": "Sony ILX-LR1 24mm",
+        "altitude_ft": 200.0,
+        "oblique_look_angle_deg": 35.0,
+        "offset_from_road_edge_ft": 100.0,
+        "forward_overlap_pct": 80.0,
+        "flight_side": "Both",
+        "lines_per_side": 1,
+        "cross_flight": False,
+        "cross_flight_type": "None",
+    }
+
+    baseline3 = [
+        {**baseline, "scenario_name": "B01_Nadir_Astro_200", "experiment_group": "Flight Mode", "flight_mode": "Nadir only", "oblique_look_angle_deg": 0.0},
+        {**baseline, "scenario_name": "B02_Oblique_Astro_A35", "experiment_group": "Flight Mode", "flight_mode": "Oblique only"},
+        {**baseline, "scenario_name": "B03_Combined_Astro_A35", "experiment_group": "Flight Mode", "flight_mode": "Oblique + Nadir"},
+    ]
+    angle3 = [
+        {**baseline, "scenario_name": f"ANG_{a:02d}_Astro", "experiment_group": "Angle", "flight_mode": "Oblique + Nadir", "oblique_look_angle_deg": float(a)}
+        for a in (25, 35, 45)
+    ]
+    altitude3 = [
+        {**baseline, "scenario_name": f"ALT_{h:03d}_Astro", "experiment_group": "Altitude", "flight_mode": "Oblique + Nadir", "altitude_ft": float(h)}
+        for h in (150, 200, 250)
+    ]
+    platform3 = [
+        {**baseline, "scenario_name": "CAM_Astro_LR1", "experiment_group": "Camera", "flight_mode": "Oblique + Nadir"},
+        {**baseline, "scenario_name": "CAM_X10_Wide", "experiment_group": "Camera", "flight_mode": "Oblique + Nadir", "platform": "Skydio X10", "camera": "V100-L Wide"},
+        {**baseline, "scenario_name": "CAM_X10_Narrow", "experiment_group": "Camera", "flight_mode": "Oblique + Nadir", "platform": "Skydio X10", "camera": "V100-L Narrow"},
+    ]
+    offset3 = [
+        {**baseline, "scenario_name": f"OFF_{o:03d}_Astro", "experiment_group": "Offset", "flight_mode": "Oblique + Nadir", "offset_from_road_edge_ft": float(o)}
+        for o in (50, 100, 150)
+    ]
+    overlap3 = [
+        {**baseline, "scenario_name": f"FOL_{ol:02d}_Astro", "experiment_group": "Forward Overlap", "flight_mode": "Oblique + Nadir", "forward_overlap_pct": float(ol)}
+        for ol in (75, 80, 85)
+    ]
+    side3 = [
+        {**baseline, "scenario_name": f"SIDE_{side}_Astro", "experiment_group": "Flight Side", "flight_mode": "Oblique + Nadir", "flight_side": side}
+        for side in ("Left", "Right", "Both")
+    ]
+    lines2 = [
+        {**baseline, "scenario_name": f"LINES_{n}_Astro", "experiment_group": "Lines per Side", "flight_mode": "Oblique + Nadir", "lines_per_side": n}
+        for n in (1, 2)
+    ]
+    gcp_patterns5 = [
+        {**baseline, "scenario_name": f"GCPP_{i+1}_{safe_name(pat)}", "experiment_group": "GCP Pattern", "flight_mode": "Oblique + Nadir", "gcp_pattern": pat}
+        for i, pat in enumerate(("Staggered + Terminal Pairs", "Staggered", "Bilateral Pairs", "One-Sided", "Centerline"))
+    ]
+    gcp_spacing3 = [
+        {**baseline, "scenario_name": f"GCPS_{sp:03d}_Astro", "experiment_group": "GCP Spacing", "flight_mode": "Oblique + Nadir", "gcp_spacing_ft": float(sp)}
+        for sp in (200, 300, 500)
+    ]
+    acquisition9 = [
+        {**baseline, "scenario_name": f"ACQ_V{v}_S{den}", "experiment_group": "Acquisition", "flight_mode": "Oblique + Nadir", "flight_speed_mps": float(v), "shutter_speed_s": 1.0/float(den)}
+        for v in (3, 5, 7) for den in (500, 1000, 2000)
+    ]
+
+    cameras = [
+        ("Freefly Astro", "Sony ILX-LR1 24mm", "Astro"),
+        ("Skydio X10", "V100-L Wide", "X10W"),
+        ("Skydio X10", "V100-L Narrow", "X10N"),
+    ]
+    geometry81 = []
+    for platform, camera, tag in cameras:
+        for h in (150, 200, 250):
+            for a in (25, 35, 45):
+                for o in (50, 100, 150):
+                    geometry81.append({
+                        **baseline, "scenario_name": f"GEO_{tag}_H{h}_A{a}_O{o}", "experiment_group": "Geometry Matrix",
+                        "platform": platform, "camera": camera, "flight_mode": "Oblique + Nadir",
+                        "altitude_ft": float(h), "oblique_look_angle_deg": float(a), "offset_from_road_edge_ft": float(o),
+                    })
+
+    factorial243 = []
+    for platform, camera, tag in cameras:
+        for h in (150, 200, 250):
+            for a in (25, 35, 45):
+                for o in (50, 100, 150):
+                    for ol in (75, 80, 85):
+                        factorial243.append({
+                            **baseline, "scenario_name": f"FAC_{tag}_H{h}_A{a}_O{o}_F{ol}", "experiment_group": "Geometry + Overlap Full Factorial",
+                            "platform": platform, "camera": camera, "flight_mode": "Oblique + Nadir",
+                            "altitude_ft": float(h), "oblique_look_angle_deg": float(a), "offset_from_road_edge_ft": float(o),
+                            "forward_overlap_pct": float(ol),
+                        })
+
+    core10 = [baseline3[0], baseline3[1], baseline3[2], angle3[0], angle3[2], altitude3[0], altitude3[2], platform3[1], platform3[2], offset3[2]]
+    comprehensive = _dedupe_batch_rows(
+        baseline3 + angle3 + altitude3 + platform3 + offset3 + overlap3 + side3 + lines2 + gcp_patterns5 + gcp_spacing3 + acquisition9 + geometry81
+    )
+
+    templates = {
+        "Baseline: Nadir vs Oblique vs Combined (3 base)": baseline3,
+        "Oblique Angle Sensitivity: 25 / 35 / 45 deg (3 base)": angle3,
+        "Altitude Sensitivity: 150 / 200 / 250 ft (3 base)": altitude3,
+        "Platform / Camera: Astro / X10 Wide / X10 Narrow (3 base)": platform3,
+        "Offset Sensitivity: 50 / 100 / 150 ft (3 base)": offset3,
+        "Forward Overlap: 75 / 80 / 85% (3 base)": overlap3,
+        "Flight Side: Left / Right / Both (3 base)": side3,
+        "Lines per Side: 1 / 2 (2 base)": lines2,
+        "GCP Pattern Sensitivity (5 base)": gcp_patterns5,
+        "GCP Spacing: 200 / 300 / 500 ft (3 base)": gcp_spacing3,
+        "Acquisition Blur: speed x shutter (9 base)": acquisition9,
+        "Core Research Set (10 base)": core10,
+        "Comprehensive Geometry Matrix (81 base)": geometry81,
+        "Comprehensive Sensitivity Suite (~base 100+)": comprehensive,
+        "Maximum Geometry + Overlap Factorial (243 base)": factorial243,
+    }
+    return [dict(r) for r in templates.get(template_name, core10)]
+
+def scenario_from_batch_row(base_s: Scenario, row: Dict[str, object]) -> Scenario:
+    """Clone the current GUI scenario and apply one batch-row override."""
+    data = asdict(base_s)
+    for key, value in row.items():
+        if key not in data or pd.isna(value):
+            continue
+        data[key] = value
+
+    # Normalize values that can arrive from Streamlit's editable dataframe.
+    data["scenario_name"] = str(data.get("scenario_name") or "Batch_Scenario")
+    data["platform"] = str(data.get("platform") or base_s.platform)
+    data["camera"] = str(data.get("camera") or base_s.camera)
+    for key in ["altitude_ft", "oblique_look_angle_deg", "offset_from_road_edge_ft", "forward_overlap_pct"]:
+        data[key] = float(data[key])
+    data["lines_per_side"] = int(data.get("lines_per_side", 1))
+    for key in ["cross_flight"]:
+        value = data.get(key, False)
+        if isinstance(value, str):
+            data[key] = value.strip().lower() in ("true", "1", "yes", "y")
+        else:
+            data[key] = bool(value)
+    if not data["cross_flight"]:
+        data["cross_flight_type"] = "None"
+    elif str(data.get("cross_flight_type", "Single")) == "None":
+        data["cross_flight_type"] = "Single"
+
+    # Camera geometry must follow the selected platform/camera, not the base GUI camera.
+    platform = data["platform"]
+    camera = data["camera"]
+    if platform not in CAMERA_MODELS:
+        raise ValueError(f"Unknown platform in batch row: {platform}")
+    if camera not in CAMERA_MODELS[platform]:
+        raise ValueError(f"Unknown camera '{camera}' for platform '{platform}'.")
+    cam = CAMERA_MODELS[platform][camera]
+    for key in ["focal_length_mm", "sensor_width_mm", "sensor_height_mm", "image_width_px", "image_height_px", "hfov_deg", "vfov_deg"]:
+        if key in cam:
+            data[key] = cam[key]
+    if platform == "Skydio X10":
+        data["aperture_f"] = 1.95 if camera == "V100-L Wide" else 1.8
+    return Scenario(**data)
+
+
+def evaluate_batch_scenario(
+    scenario: Scenario,
+    center_lonlat: List[Tuple[float, float]],
+    center_xy: List[Tuple[float, float]],
+) -> Dict[str, object]:
+    """Run the existing planning engines for one scenario without touching the GUI."""
+    fp_i = camera_footprint(scenario)
+    geometry_i = build_geometry(center_xy, scenario)
+    flight_i = build_flight_plan(center_xy, scenario, fp_i)
+    targets_i = build_targets(center_xy, scenario)
+    checks_i = run_checks(scenario, geometry_i, flight_i, targets_i, fp_i)
+    acc_df_i, acc_summary_i = preflight_accuracy_assessment(scenario, geometry_i, flight_i, targets_i, fp_i)
+    summary_i = scenario_summary_dict(scenario, geometry_i, flight_i, targets_i, checks_i, fp_i)
+    summary_i.update({
+        "overall_score": acc_summary_i.get("overall_score"),
+        "mean_rmseh_cm": acc_summary_i.get("mean_rmseh_cm"),
+        "mean_rmsev_cm": acc_summary_i.get("mean_rmsev_cm"),
+        "max_rmseh_cm": acc_summary_i.get("max_rmseh_cm"),
+        "max_rmsev_cm": acc_summary_i.get("max_rmsev_cm"),
+        "weak_count": acc_summary_i.get("weak_count"),
+        "preflight_status": acc_summary_i.get("status"),
+        "oblique_look_angle_deg": scenario.oblique_look_angle_deg,
+        "flight_side": scenario.flight_side,
+        "positioning_mode": scenario.positioning_mode,
+        "ground_control_strategy": scenario.ground_control_strategy,
+        "gcp_pattern": scenario.gcp_pattern,
+    })
+    gm = gcp_layout_metrics(geometry_i["centerline"], scenario, targets_i, geometry_i)
+    summary_i["gcp_density_per_km"] = gm.get("gcp_density_per_km")
+    acq_i = acquisition_metrics(scenario, fp_i)
+    summary_i["worst_case_motion_blur_px"] = acq_i.get("worst_case_motion_blur_px")
+    summary_i["motion_blur_status"] = acq_i.get("motion_blur_status")
+    return {
+        "scenario": scenario, "fp": fp_i, "geometry": geometry_i, "flight": flight_i,
+        "targets": targets_i, "checks": checks_i, "acc_df": acc_df_i,
+        "acc_summary": acc_summary_i, "summary": summary_i,
+    }
+
+
+def build_cross_flight_pair_comparison(comparison_df: pd.DataFrame) -> pd.DataFrame:
+    """Compare matched _XOFF / _XON scenarios and report ON minus OFF deltas."""
+    if comparison_df.empty or "scenario_name" not in comparison_df.columns:
+        return pd.DataFrame()
+    df = comparison_df.copy()
+    df["pair_id"] = df["scenario_name"].astype(str).str.replace(r"_X(?:OFF|ON)$", "", regex=True)
+    df["cross_state"] = df["scenario_name"].astype(str).str.extract(r"_X(OFF|ON)$", expand=False)
+    metrics = [c for c in ["estimated_image_count", "mean_rmseh_cm", "mean_rmsev_cm", "overall_score", "weak_count"] if c in df.columns]
+    rows = []
+    for pair_id, g in df.dropna(subset=["cross_state"]).groupby("pair_id"):
+        states = {str(r["cross_state"]): r for _, r in g.iterrows()}
+        if "OFF" not in states or "ON" not in states:
+            continue
+        off, on = states["OFF"], states["ON"]
+        row = {"pair_id": pair_id}
+        for c in ["platform", "camera", "flight_mode", "altitude_ft", "oblique_look_angle_deg", "offset_from_road_edge_ft", "forward_overlap_pct"]:
+            if c in df.columns:
+                row[c] = off.get(c)
+        for m in metrics:
+            try:
+                ov, nv = float(off.get(m)), float(on.get(m))
+                row[f"{m}_OFF"] = ov
+                row[f"{m}_ON"] = nv
+                row[f"delta_{m}_ON_minus_OFF"] = nv - ov
+            except Exception:
+                pass
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def build_side_cross_factorial_comparison(comparison_df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize matched One-side/Both-side x Cross OFF/ON four-way groups."""
+    if comparison_df.empty or "scenario_name" not in comparison_df.columns:
+        return pd.DataFrame()
+    df = comparison_df.copy()
+    pat = r"_(ONE_(?:LEFT|RIGHT)|BOTH)_X(OFF|ON)$"
+    ext = df["scenario_name"].astype(str).str.extract(pat)
+    df["side_state"] = ext[0]
+    df["cross_state"] = ext[1]
+    df["factorial_id"] = df["scenario_name"].astype(str).str.replace(pat, "", regex=True)
+    metrics = [c for c in ["estimated_image_count", "mean_rmseh_cm", "mean_rmsev_cm", "overall_score", "weak_count"] if c in df.columns]
+    rows = []
+    for fid, g in df.dropna(subset=["side_state", "cross_state"]).groupby("factorial_id"):
+        states = {(str(r["side_state"]), str(r["cross_state"])): r for _, r in g.iterrows()}
+        one_keys = [k for k in states if k[0].startswith("ONE_")]
+        if not one_keys:
+            continue
+        one_label = one_keys[0][0]
+        needed = [(one_label, "OFF"), (one_label, "ON"), ("BOTH", "OFF"), ("BOTH", "ON")]
+        if any(k not in states for k in needed):
+            continue
+        ref = states[(one_label, "OFF")]
+        row = {"factorial_id": fid, "one_side": one_label.replace("ONE_", "").title()}
+        for c in ["platform", "camera", "flight_mode", "altitude_ft", "oblique_look_angle_deg", "offset_from_road_edge_ft", "forward_overlap_pct"]:
+            if c in df.columns:
+                row[c] = ref.get(c)
+        labels = {
+            (one_label, "OFF"): "ONE_XOFF",
+            (one_label, "ON"): "ONE_XON",
+            ("BOTH", "OFF"): "BOTH_XOFF",
+            ("BOTH", "ON"): "BOTH_XON",
+        }
+        for m in metrics:
+            vals = {}
+            for key, lab in labels.items():
+                try:
+                    vals[lab] = float(states[key].get(m))
+                    row[f"{m}_{lab}"] = vals[lab]
+                except Exception:
+                    pass
+            if "ONE_XOFF" in vals and "BOTH_XOFF" in vals:
+                row[f"delta_{m}_BOTH_minus_ONE_at_XOFF"] = vals["BOTH_XOFF"] - vals["ONE_XOFF"]
+            if "ONE_XON" in vals and "BOTH_XON" in vals:
+                row[f"delta_{m}_BOTH_minus_ONE_at_XON"] = vals["BOTH_XON"] - vals["ONE_XON"]
+            if "ONE_XOFF" in vals and "ONE_XON" in vals:
+                row[f"delta_{m}_XON_minus_XOFF_at_ONE"] = vals["ONE_XON"] - vals["ONE_XOFF"]
+            if "BOTH_XOFF" in vals and "BOTH_XON" in vals:
+                row[f"delta_{m}_XON_minus_XOFF_at_BOTH"] = vals["BOTH_XON"] - vals["BOTH_XOFF"]
+            if all(k in vals for k in ("ONE_XOFF", "ONE_XON", "BOTH_XOFF", "BOTH_XON")):
+                row[f"interaction_{m}"] = (vals["BOTH_XON"] - vals["BOTH_XOFF"]) - (vals["ONE_XON"] - vals["ONE_XOFF"])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_batch_index_html(batch_name: str, comparison_df: pd.DataFrame, notes: str = "") -> bytes:
+    """Build a compact batch-level comparative full report/index, including cross-flight pairs."""
+    import base64
+    chart = make_scenario_comparison_png(comparison_df) if not comparison_df.empty else b""
+    chart64 = base64.b64encode(chart).decode("ascii") if chart else ""
+    table_html = comparison_df.to_html(index=False, border=0, classes="data") if not comparison_df.empty else "<p>No results.</p>"
+    pair_df = build_cross_flight_pair_comparison(comparison_df)
+    pair_html = pair_df.to_html(index=False, border=0, classes="data") if not pair_df.empty else "<p>No matched _XOFF/_XON pairs were found.</p>"
+    factorial_df = build_side_cross_factorial_comparison(comparison_df)
+    factorial_html = factorial_df.to_html(index=False, border=0, classes="data") if not factorial_df.empty else "<p>No complete four-way side/cross factorial groups were found.</p>"
+    html = f"""<!doctype html><html><head><meta charset='utf-8'><title>{batch_name}</title>
+    <style>body{{font-family:Arial;margin:28px;color:#202124}}h1,h2{{color:#202124}}table.data{{border-collapse:collapse;width:100%;font-size:12px}}table.data th,table.data td{{border:1px solid #bbb;padding:5px}}table.data th{{background:#e9ecef}}.scroll{{overflow-x:auto}}.note{{background:#f6f8fa;border-left:4px solid #4b8;padding:10px}}img{{max-width:100%;border:1px solid #ccc}}</style></head><body>
+    <h1>Oblique UAS Batch Scenario Analysis Report</h1>
+    <div class='note'><b>Batch:</b> {batch_name}<br>{notes}<br>Each scenario inherits the current GUI site/survey/acquisition settings unless overridden by the batch table. Predicted RMSE remains a planning-level comparison metric, not measured positional accuracy.</div>
+    <h2>Scenario Comparison</h2><div class='scroll'>{table_html}</div>
+    <h2>Cross-Flight Paired Comparison (ON minus OFF)</h2><div class='scroll'>{pair_html}</div>
+    <h2>Flight-Side × Cross-Flight Four-Way Factorial Comparison</h2><div class='scroll'>{factorial_html}</div>
+    <h2>Comparison Chart</h2>{f"<img src='data:image/png;base64,{chart64}'>" if chart64 else ''}
+    <h2>Interpretation</h2><p>Use the cross-flight paired table to isolate the effect of adding the single nadir cross flight. Use the four-way factorial table to compare One-side versus Both-side oblique coverage, Cross OFF versus ON, and their interaction while holding camera, altitude, angle, offset, overlap, and control settings constant.</p>
+    </body></html>"""
+    return html.encode("utf-8")
+
+
+def build_batch_zip_bytes(
+    base_s: Scenario,
+    batch_name: str,
+    batch_rows: List[Dict[str, object]],
+    center_lonlat: List[Tuple[float, float]],
+    center_xy: List[Tuple[float, float]],
+    centerline_source: str,
+    include_full_html: bool = True,
+    include_pdf: bool = True,
+    include_kmz: bool = True,
+    include_mission_transfer: bool = False,
+) -> Tuple[bytes, pd.DataFrame]:
+    """Run all batch rows and return one ZIP plus the comparison dataframe."""
+    lon0, lat0 = center_lonlat[0]
+    results = []
+    for row in batch_rows:
+        scenario = scenario_from_batch_row(base_s, row)
+        results.append(evaluate_batch_scenario(scenario, center_lonlat, center_xy))
+
+    batch_summaries = [r["summary"] for r in results]
+    comparison_df = pd.DataFrame(batch_summaries)
+    if not comparison_df.empty:
+        preferred = [
+            "scenario_name", "platform", "camera", "altitude_ft", "offset_from_road_edge_ft", "oblique_look_angle_deg",
+            "flight_mode", "flight_side", "cross_flight", "positioning_mode", "ground_control_strategy", "gcp_pattern",
+            "forward_overlap_pct", "side_overlap_pct", "estimated_image_count", "gcp_count", "gcp_density_per_km", "checkpoint_count",
+            "mean_rmseh_cm", "mean_rmsev_cm", "overall_score", "weak_count", "preflight_status", "status",
+        ]
+        comparison_df = comparison_df[[c for c in preferred if c in comparison_df.columns]].drop_duplicates(subset=["scenario_name"], keep="last")
+    # Add acquisition screening fields that the standard comparison function omits.
+    if batch_summaries:
+        extra = pd.DataFrame(batch_summaries)[[c for c in ["scenario_name", "platform", "camera", "worst_case_motion_blur_px", "motion_blur_status"] if c in pd.DataFrame(batch_summaries).columns]]
+        if not extra.empty and "scenario_name" in comparison_df.columns:
+            comparison_df = comparison_df.merge(extra.drop_duplicates("scenario_name"), on="scenario_name", how="left")
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("00_Batch_Report/Batch_Comparison.csv", df_to_csv_bytes(comparison_df))
+        pair_df = build_cross_flight_pair_comparison(comparison_df)
+        if not pair_df.empty:
+            zf.writestr("00_Batch_Report/Cross_Flight_Pair_Comparison.csv", df_to_csv_bytes(pair_df))
+        factorial_df = build_side_cross_factorial_comparison(comparison_df)
+        if not factorial_df.empty:
+            zf.writestr("00_Batch_Report/Side_Cross_Four_Way_Comparison.csv", df_to_csv_bytes(factorial_df))
+        zf.writestr("00_Batch_Report/Batch_Full_Report.html", build_batch_index_html(batch_name, comparison_df, "For the recommended 4-way expansion, every base geometry is evaluated as One-side/Both-side × Cross Flight OFF/ON."))
+        zf.writestr("00_Batch_Report/Batch_Scenarios.csv", pd.DataFrame(batch_rows).to_csv(index=False).encode("utf-8"))
+
+        for r in results:
+            sc = r["scenario"]
+            folder = f"{safe_name(sc.scenario_name)}/"
+            # Full per-scenario HTML can be disabled for very large factorial batches.
+            if include_full_html:
+                full_html = build_full_html_report(sc, centerline_source, r["geometry"], r["flight"], r["targets"], r["checks"], r["fp"], r["acc_df"], r["acc_summary"], batch_summaries)
+                zf.writestr(folder + f"{safe_name(sc.scenario_name)}_Full_Report.html", full_html)
+            zf.writestr(folder + f"{safe_name(sc.scenario_name)}_Summary.csv", pd.DataFrame([r["summary"]]).to_csv(index=False).encode("utf-8"))
+            zf.writestr(folder + f"{safe_name(sc.scenario_name)}_Preflight_Accuracy.csv", df_to_csv_bytes(r["acc_df"]))
+            zf.writestr(folder + f"{safe_name(sc.scenario_name)}_Constraints.csv", pd.DataFrame(r["checks"]).to_csv(index=False).encode("utf-8"))
+            zf.writestr(folder + f"{safe_name(sc.scenario_name)}_Scenario.json", json.dumps({**asdict(sc), "summary": r["summary"], "checks": r["checks"]}, indent=2).encode("utf-8"))
+            zf.writestr(folder + f"{safe_name(sc.scenario_name)}_Acquisition_Settings.json", build_acquisition_settings_bytes(sc, r["fp"]))
+            if include_pdf:
+                pdf = build_preflight_pdf_report(sc, centerline_source, r["geometry"], r["flight"], r["targets"], r["checks"], r["fp"], r["acc_df"], r["acc_summary"], batch_summaries)
+                zf.writestr(folder + f"{safe_name(sc.scenario_name)}_Executive_Summary.pdf", pdf)
+            if include_kmz:
+                zf.writestr(folder + f"{safe_name(sc.scenario_name)}.kmz", build_kmz_bytes(sc, center_lonlat, r["geometry"], r["flight"], r["targets"], r["checks"], r["fp"]))
+            if include_mission_transfer:
+                wp_df = build_mission_waypoint_df(sc, r["flight"], lon0, lat0)
+                zf.writestr(folder + f"{safe_name(sc.scenario_name)}_Mission_Waypoints.csv", df_to_csv_bytes(wp_df))
+                if sc.platform == "Freefly Astro":
+                    zf.writestr(folder + f"{safe_name(sc.scenario_name)}_Astro_AMC.plan", build_astro_plan_bytes(sc, r["flight"], lon0, lat0))
+                else:
+                    zf.writestr(folder + f"{safe_name(sc.scenario_name)}_X10_Transfer_Note.txt", build_skydio_transfer_note_bytes(sc))
+    return out.getvalue(), comparison_df
+
 # -----------------------------------------------------------------------------
 # Streamlit GUI.
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Oblique UAS Planning Simulator", layout="wide")
 st.title("Oblique UAS Highway Mapping Experiment Planning Simulator")
-st.caption("Version 3.1 prototype — ASPRS-informed GSD/overlap/metadata, full HTML report, executive PDF summary, scenario comparison, KMZ/CSV/JSON export")
+st.caption("Version 3.6 prototype — 4-way factorial batch expansion: One-side/Both-side × Cross Flight OFF/ON")
 
 if "saved_scenarios" not in st.session_state:
     st.session_state.saved_scenarios = []
@@ -2089,7 +3014,7 @@ with st.sidebar:
 # Tabs requested by the design document.
 tabs = st.tabs([
     "Project", "Site", "UAS & Camera", "Flight Planning", "Survey Planning",
-    "Footprint & Coverage", "Pre-flight Accuracy Report", "Constraint Check", "Scenario Manager", "Export"
+    "Footprint & Coverage", "Pre-flight Accuracy Report", "Constraint Check", "Scenario Manager", "Export", "Batch Analysis"
 ])
 
 with tabs[0]:
@@ -2123,8 +3048,8 @@ with tabs[2]:
     platform = c1.selectbox("Platform", list(CAMERA_MODELS.keys()), index=0)
     camera = c2.selectbox("Camera", list(CAMERA_MODELS[platform].keys()), index=0)
     cam = CAMERA_MODELS[platform][camera]
-    oblique_look_angle_deg = c3.slider("Oblique Look Angle (deg)", 0, 70, 45)
-    c3.caption("Default 45°. ASPRS notes typical oblique camera look angles are often 40–50°; other angles may be justified when accuracy is documented.")
+    oblique_look_angle_deg = c3.slider("Oblique Look Angle (deg)", 0, 70, 35)
+    c3.caption("Default 35° for the Caltrans experimental baseline. The slider remains 0–70° so additional oblique-angle scenarios can be tested.")
 
     c4, c5, c6, c7 = st.columns(4)
     focal_length_mm = c4.number_input("Focal Length (mm)", value=float(cam.get("focal_length_mm", 0.0)), step=1.0)
@@ -2174,7 +3099,22 @@ with tabs[3]:
     forward_overlap_pct = c9.slider("Forward Overlap (%)", 50, 95, 80)
     side_overlap_pct = c10.slider("Side Overlap (%)", 30, 90, 70, disabled=(lines_per_side == 1))
 
-    st.info("All camera footprints are generated at every image center and projected to the selected ground-height plane. Flight direction follows the uploaded centerline start point to end point for nadir and oblique lines. Oblique footprints use the same image width/height axis convention as nadir footprints. Cross-flight footprints remain nadir rectangles. KMZ can also include 3D camera centers and orientation rays.")
+    st.markdown("### Acquisition Settings")
+    a1, a2, a3 = st.columns(3)
+    flight_speed_mps = a1.number_input("Flight Speed (m/s)", min_value=0.5, max_value=20.0, value=5.0, step=0.5)
+    exposure_mode = a2.selectbox("Exposure Mode", ["Manual", "Auto"], index=0)
+    shutter_denominator = int(a3.selectbox("Shutter Speed", [250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400, 8000], index=6, format_func=lambda x: f"1/{x} s"))
+    shutter_speed_s = 1.0 / max(shutter_denominator, 1)
+
+    a4, a5, a6, a7 = st.columns(4)
+    iso = int(a4.selectbox("ISO", [100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 3200, 6400, 12800, 16000], index=0))
+    aperture_default = 5.6 if platform == "Freefly Astro" else (1.95 if camera == "V100-L Wide" else 1.8)
+    aperture_f = a5.number_input("Aperture (f-number)", min_value=1.0, max_value=22.0, value=float(aperture_default), step=0.1, disabled=(platform == "Skydio X10"), help="Skydio X10 V100-L aperture is treated as fixed for planning; Astro/LR1 remains user-configurable.")
+    focus_mode = a6.selectbox("Focus Mode", ["Manual / Infinity", "Autofocus", "Manual"], index=0)
+    image_format = a7.selectbox("Image Format", ["JPEG", "RAW + JPEG", "RAW"], index=0)
+    trigger_mode = st.selectbox("Capture Trigger Mode", ["Distance-based", "Time-based", "Waypoint / planned image centers"], index=0)
+
+    st.info("All camera footprints are generated at every image center and projected to the selected ground-height plane. Acquisition settings are used for trigger-spacing, trigger-interval, and motion-blur screening. Flight direction follows the uploaded centerline start point to end point for nadir and oblique lines. Cross-flight footprints remain nadir rectangles.")
 
     # Deprecated fields removed from GUI.
     cross_flight = cross_flight_enabled
@@ -2182,8 +3122,30 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("Survey Planning")
     survey_mode = st.selectbox("Survey Mode", ["Cal Expo Validation Mode", "Highway Mode"], index=0)
+
+    st.markdown("### Direct Georeferencing and Ground Control")
+    c0, c00 = st.columns(2)
+    positioning_mode = c0.selectbox("Camera Positioning", ["Standalone GNSS", "RTK", "PPK", "RTK/PPK + GCP"], index=3)
+    ground_control_strategy = c00.selectbox("Ground Control Strategy", ["GCP-free", "Minimal", "Corridor Reference", "Dense", "Custom"], index=2, help="Research scenario label. The simulator does not treat these names as ASPRS accuracy classes.")
+
+    gcp_pattern = st.selectbox(
+        "GCP Distribution Pattern",
+        ["Staggered + Terminal Pairs", "Staggered", "Bilateral Pairs", "One-Sided", "Centerline"],
+        index=0,
+        help="Corridor-oriented experimental patterns. Centerline and one-sided layouts are retained mainly as weak-geometry comparison cases.",
+    )
+    cpat1, cpat2, cpat3 = st.columns(3)
+    if gcp_pattern == "One-Sided":
+        gcp_one_sided_side = cpat1.selectbox("One-Sided GCP Side", ["Left", "Right"], index=0)
+    else:
+        gcp_one_sided_side = "Left"
+        cpat1.caption("One-sided side: N/A")
+    force_start_terminal_pair = cpat2.checkbox("Force Start Terminal Pair", value=True, disabled=(gcp_pattern != "Staggered + Terminal Pairs"))
+    force_end_terminal_pair = cpat3.checkbox("Force End Terminal Pair", value=True, disabled=(gcp_pattern != "Staggered + Terminal Pairs"))
+    terminal_pair_inset_ft = st.number_input("Terminal Pair Inset from Corridor Ends (ft)", min_value=0.0, value=0.0, step=10.0, disabled=(gcp_pattern != "Staggered + Terminal Pairs"))
+
     c1, c2, c3, c4 = st.columns(4)
-    gcp_spacing_ft = c1.number_input("GCP Spacing (ft)", min_value=50.0, value=300.0, step=25.0)
+    gcp_spacing_ft = c1.number_input("GCP Spacing (ft)", min_value=25.0, value=300.0, step=25.0)
     checkpoint_spacing_ft = c2.number_input("Checkpoint Spacing (ft)", min_value=25.0, value=300.0, step=25.0)
     gcp_offset_from_road_edge_ft = c3.number_input("GCP Offset from Road Edge (ft)", min_value=0.0, value=25.0, step=5.0)
     checkpoint_offset_from_road_edge_ft = c4.number_input("Checkpoint Offset from Road Edge (ft)", min_value=0.0, value=25.0, step=5.0)
@@ -2191,7 +3153,11 @@ with tabs[4]:
     c5, c6, c7 = st.columns(3)
     safety_offset_ft = c5.number_input("Safety Offset (ft)", min_value=0.0, value=10.0, step=5.0)
     target_size_ft = c6.number_input("Target Size (ft)", min_value=0.5, value=2.0, step=0.5)
-    placement_side = c7.selectbox("Placement Side", ["Both", "Left", "Right"], index=0)
+    placement_side = c7.selectbox("Placement Side", ["Both", "Left", "Right"], index=0, help="Used by bilateral/staggered GCP patterns and checkpoint placement.")
+
+    cgcpa, cgcpb = st.columns(2)
+    minimum_gcp_count = int(cgcpa.number_input("Project Target Minimum GCP Count", min_value=0, value=10, step=1, help="Project planning target only; ASPRS does not prescribe one universal minimum GCP count for UAS photogrammetry."))
+    minimum_gcp_checkpoint_separation_ft = cgcpb.number_input("Minimum GCP-to-Checkpoint Separation (ft)", min_value=0.0, value=50.0, step=10.0, help="Planning threshold used to flag checkpoints that may not be sufficiently independent from control. Not an ASPRS fixed-distance requirement.")
 
     checkpoint_distribution = st.selectbox(
         "Checkpoint Distribution",
@@ -2220,7 +3186,7 @@ with tabs[4]:
         st.caption("Custom zone checkboxes are hidden because a preset distribution mode is selected.")
 
     minimum_checkpoint_count = int(st.number_input("Minimum Total Checkpoint Count", min_value=1, value=50, step=1))
-    st.info("Balanced mode distributes checkpoints among centerline, road-edge, and outside-roadway zones. Default spacing is 300 ft; if the total count is below the minimum, station spacing is automatically densified for export.")
+    st.info("GCP patterns support corridor experiments including staggered/zigzag layouts, terminal pairs, bilateral pairs, one-sided controls, centerline weak-geometry cases, and GCP-free direct-georeferencing tests. Checkpoints remain independent validation points. The 30-checkpoint ASPRS sample-size check is reported separately from the project target count.")
 
 with tabs[5]:
     st.subheader("Footprint & Coverage")
@@ -2247,6 +3213,8 @@ s = Scenario(
     cross_flight=cross_flight,
     cross_flight_type=cross_flight_type, cross_flight_angle_deg=cross_flight_angle_deg,
     forward_overlap_pct=forward_overlap_pct, side_overlap_pct=side_overlap_pct,
+    flight_speed_mps=flight_speed_mps, exposure_mode=exposure_mode, shutter_speed_s=shutter_speed_s,
+    iso=iso, aperture_f=aperture_f, focus_mode=focus_mode, image_format=image_format, trigger_mode=trigger_mode,
     survey_mode=survey_mode,
     gcp_spacing_ft=gcp_spacing_ft, checkpoint_spacing_ft=checkpoint_spacing_ft,
     gcp_offset_from_road_edge_ft=gcp_offset_from_road_edge_ft,
@@ -2258,6 +3226,11 @@ s = Scenario(
     include_outside_checkpoints=include_outside_checkpoints,
     checkpoint_distribution=checkpoint_distribution,
     minimum_checkpoint_count=minimum_checkpoint_count,
+    positioning_mode=positioning_mode, ground_control_strategy=ground_control_strategy,
+    gcp_pattern=gcp_pattern, gcp_one_sided_side=gcp_one_sided_side,
+    force_start_terminal_pair=force_start_terminal_pair, force_end_terminal_pair=force_end_terminal_pair,
+    terminal_pair_inset_ft=terminal_pair_inset_ft, minimum_gcp_count=minimum_gcp_count,
+    minimum_gcp_checkpoint_separation_ft=minimum_gcp_checkpoint_separation_ft,
     show_footprints=show_footprints, show_image_centers=show_image_centers,
     show_viewing_direction=show_viewing_direction, show_camera_orientation_3d=show_camera_orientation_3d, coverage_target=coverage_target,
     minimum_required_coverage_pct=minimum_required_coverage_pct,
@@ -2288,6 +3261,24 @@ with tabs[1]:
     c4.metric("Stations", len(geometry["stations"]))
     st.write(f"Centerline source: `{centerline_source}`")
 
+with tabs[4]:
+    st.divider()
+    st.markdown("### GCP Corridor Geometry Metrics")
+    gcp_m_ui = gcp_layout_metrics(geometry["centerline"], s, targets, geometry)
+    g1, g2, g3, g4 = st.columns(4)
+    g1.metric("GCP Count", gcp_m_ui["gcp_count"])
+    g2.metric("GCP Density", "N/A" if gcp_m_ui.get("gcp_density_per_km") is None else f"{gcp_m_ui['gcp_density_per_km']:.2f} /km")
+    g3.metric("Max Longitudinal Gap", "N/A" if gcp_m_ui.get("max_longitudinal_gap_ft") is None else f"{gcp_m_ui['max_longitudinal_gap_ft']:.0f} ft")
+    g4.metric("Longitudinal Coverage", f"{100*gcp_m_ui['longitudinal_coverage_ratio']:.1f}%")
+    g5, g6, g7, g8 = st.columns(4)
+    g5.metric("Left / Right GCPs", f"{gcp_m_ui['left_gcp_count']} / {gcp_m_ui['right_gcp_count']}")
+    g6.metric("Cross-Corridor Spread Ratio", f"{gcp_m_ui['cross_corridor_spread_ratio']:.2f}")
+    g7.metric("Terminal Pairs", f"{gcp_m_ui['start_terminal_pair_present']} / {gcp_m_ui['end_terminal_pair_present']}")
+    g8.metric("Supplemental GDI", "N/A" if gcp_m_ui.get("gdi_supplemental") is None else f"{gcp_m_ui['gdi_supplemental']:.2f}")
+    st.caption("These are corridor experiment-design indicators, not ASPRS pass/fail thresholds. GDI is shown only as a supplemental 2D convex-hull metric and should be interpreted cautiously for long, narrow projects.")
+    if gcp_m_ui.get("minimum_checkpoint_to_gcp_distance_ft") is not None:
+        st.write(f"Minimum checkpoint-to-GCP distance: **{gcp_m_ui['minimum_checkpoint_to_gcp_distance_ft']:.1f} ft**; separation warnings: **{gcp_m_ui['checkpoint_gcp_separation_violations']}**")
+
 with tabs[5]:
     st.divider()
     c1, c2, c3, c4 = st.columns(4)
@@ -2305,6 +3296,21 @@ with tabs[5]:
     c10.metric("ASPRS Near GSDc", f"{fp['asprs_oblique_near_gsdc_cm']:.3f} cm")
     c11.metric("ASPRS Mid GSDc", f"{fp['asprs_oblique_mid_gsdc_cm']:.3f} cm")
     c12.metric("ASPRS Far GSDc", f"{fp['asprs_oblique_far_gsdc_cm']:.3f} cm")
+
+    st.markdown("### Acquisition / Motion Blur Screening")
+    acq_ui = acquisition_metrics(s, fp)
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Flight Speed", f"{s.flight_speed_mps:.1f} m/s")
+    a2.metric("Trigger Distance", f"{acq_ui['trigger_distance_m']:.2f} m")
+    a3.metric("Trigger Interval", "N/A" if acq_ui.get('trigger_interval_s') is None else f"{acq_ui['trigger_interval_s']:.2f} s")
+    a4.metric("Worst Motion Blur", "N/A" if acq_ui.get('worst_case_motion_blur_px') is None else f"{acq_ui['worst_case_motion_blur_px']:.2f} px ({acq_ui['motion_blur_status']})")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Nadir Blur", "N/A" if acq_ui.get('blur_px_nadir') is None else f"{acq_ui['blur_px_nadir']:.2f} px")
+    b2.metric("Oblique Near Blur", "N/A" if acq_ui.get('blur_px_oblique_near') is None else f"{acq_ui['blur_px_oblique_near']:.2f} px")
+    b3.metric("Oblique Mid Blur", "N/A" if acq_ui.get('blur_px_oblique_mid') is None else f"{acq_ui['blur_px_oblique_mid']:.2f} px")
+    b4.metric("Oblique Far Blur", "N/A" if acq_ui.get('blur_px_oblique_far') is None else f"{acq_ui['blur_px_oblique_far']:.2f} px")
+    st.caption("Motion blur is estimated from ground speed × exposure time divided by planned GSD. It is a screening metric only and does not model vibration, wind, rolling shutter, autofocus, or actual exposure metering.")
+
     overlap_metrics_display = compute_asprs_overlap_metrics(s, flight, fp)
     st.caption("Footprints use true frame-corner projection onto a flat horizontal planning plane. DEM/height-model support is reserved for a later version. GSD and overlap summaries follow the ASPRS Addendum VI planning concepts where applicable.")
     st.dataframe(pd.DataFrame(overlap_metrics_display.get("rows", [])), width="stretch")
@@ -2425,6 +3431,21 @@ with tabs[9]:
     c5.download_button("Download Checkpoint CSV", data=df_to_csv_bytes(cp_df), file_name=f"{suggested_base}_checkpoints.csv", mime="text/csv", key="export_checkpoint_csv_download")
     c6.download_button("Download Constraint Check CSV", data=df_to_csv_bytes(checks_df), file_name=f"{suggested_base}_checks.csv", mime="text/csv", key="export_checks_csv_download")
 
+    st.markdown("### Platform Mission Transfer")
+    mission_wp_df = build_mission_waypoint_df(s, flight, lon0, lat0)
+    acquisition_json = build_acquisition_settings_bytes(s, fp)
+    m1, m2, m3 = st.columns(3)
+    m1.download_button("Download Mission Waypoint CSV", data=df_to_csv_bytes(mission_wp_df), file_name=f"{suggested_base}_mission_waypoints.csv", mime="text/csv", key="export_mission_waypoints_csv")
+    m2.download_button("Download Acquisition Settings JSON", data=acquisition_json, file_name=f"{suggested_base}_acquisition_settings.json", mime="application/json", key="export_acquisition_settings_json")
+    if s.platform == "Freefly Astro":
+        astro_plan = build_astro_plan_bytes(s, flight, lon0, lat0)
+        m3.download_button("Download Astro AMC .plan", data=astro_plan, file_name=f"{suggested_base}_Astro_AMC.plan", mime="application/json", key="export_astro_plan_download")
+        st.info("Astro export uses a standard PX4/QGroundControl-style .plan waypoint route for Auterion Mission Control review. Freefly documents AMC .plan import/export. Verify gimbal/camera payload settings and the complete mission in AMC before field execution.")
+    else:
+        skydio_note = build_skydio_transfer_note_bytes(s)
+        m3.download_button("Download X10 Transfer Note", data=skydio_note, file_name=f"{suggested_base}_X10_transfer_note.txt", mime="text/plain", key="export_skydio_note_download")
+        st.warning("Skydio X10 native .mission files are not generated here. Current Skydio documentation supports importing .mission files created by Skydio Map Capture/3D Scan. Use the exported waypoint CSV, acquisition settings, and KMZ as the transfer/review package, then recreate and verify the mission in Skydio Flight Deck / Map Capture.")
+
     c7, c8 = st.columns(2)
     preflight_pdf = build_preflight_pdf_report(s, centerline_source, geometry, flight, targets, checks, fp, acc_df, acc_summary, st.session_state.saved_scenarios)
     preflight_html = build_full_html_report(s, centerline_source, geometry, flight, targets, checks, fp, acc_df, acc_summary, st.session_state.saved_scenarios)
@@ -2435,6 +3456,144 @@ with tabs[9]:
     st.write("Scenario summary")
     st.dataframe(summary_df, width="stretch")
 
+
+with tabs[10]:
+    st.subheader("Batch Analysis")
+    st.caption("Run a predefined or edited set of research scenarios in one click. Every batch scenario inherits the current site, survey-control, checkpoint, and acquisition settings unless the table overrides a field.")
+
+    batch_template = st.selectbox(
+        "Batch Template",
+        [
+            "Baseline: Nadir vs Oblique vs Combined (3 base)",
+            "Oblique Angle Sensitivity: 25 / 35 / 45 deg (3 base)",
+            "Altitude Sensitivity: 150 / 200 / 250 ft (3 base)",
+            "Platform / Camera: Astro / X10 Wide / X10 Narrow (3 base)",
+            "Offset Sensitivity: 50 / 100 / 150 ft (3 base)",
+            "Forward Overlap: 75 / 80 / 85% (3 base)",
+            "Flight Side: Left / Right / Both (3 base)",
+            "Lines per Side: 1 / 2 (2 base)",
+            "GCP Pattern Sensitivity (5 base)",
+            "GCP Spacing: 200 / 300 / 500 ft (3 base)",
+            "Acquisition Blur: speed x shutter (9 base)",
+            "Core Research Set (10 base)",
+            "Comprehensive Geometry Matrix (81 base)",
+            "Comprehensive Sensitivity Suite (~base 100+)",
+            "Maximum Geometry + Overlap Factorial (243 base)",
+        ],
+        index=12,
+    )
+    template_rows = batch_template_rows(batch_template)
+    template_df = pd.DataFrame(template_rows)
+    st.markdown("### Batch Scenario Table")
+    st.info("The table contains base geometry scenarios. The recommended 4-way expansion below automatically evaluates each row as One-side/Both-side oblique coverage x Cross Flight OFF/ON, while keeping all other inputs identical.")
+    edited_df = st.data_editor(
+        template_df,
+        width="stretch",
+        num_rows="dynamic",
+        key=f"batch_editor_{safe_name(batch_template)}",
+        column_config={
+            "scenario_name": st.column_config.TextColumn("Scenario Name", required=True),
+            "platform": st.column_config.SelectboxColumn("Platform", options=list(CAMERA_MODELS.keys()), required=True),
+            "camera": st.column_config.TextColumn("Camera", required=True),
+            "flight_mode": st.column_config.SelectboxColumn("Flight Mode", options=["Nadir only", "Oblique only", "Oblique + Nadir"], required=True),
+            "altitude_ft": st.column_config.NumberColumn("Altitude (ft)", min_value=50.0, max_value=400.0),
+            "oblique_look_angle_deg": st.column_config.NumberColumn("Angle (deg)", min_value=0.0, max_value=70.0),
+            "offset_from_road_edge_ft": st.column_config.NumberColumn("Offset (ft)", min_value=0.0),
+            "forward_overlap_pct": st.column_config.NumberColumn("Forward OL (%)", min_value=50.0, max_value=95.0),
+            "flight_side": st.column_config.SelectboxColumn("Flight Side", options=["Both", "Left", "Right"]),
+            "lines_per_side": st.column_config.NumberColumn("Lines/Side", min_value=1, max_value=5, step=1),
+            "cross_flight": st.column_config.CheckboxColumn("Cross Flight"),
+            "gcp_spacing_ft": st.column_config.NumberColumn("GCP Spacing (ft)", min_value=25.0),
+            "gcp_pattern": st.column_config.SelectboxColumn("GCP Pattern", options=["Staggered + Terminal Pairs", "Staggered", "Bilateral Pairs", "One-Sided", "Centerline"]),
+            "flight_speed_mps": st.column_config.NumberColumn("Speed (m/s)", min_value=0.5, max_value=20.0),
+            "shutter_speed_s": st.column_config.NumberColumn("Shutter (s)", format="%.6f"),
+        },
+    )
+
+    expansion_mode = st.selectbox(
+        "Automatic Factorial Expansion",
+        [
+            "4-way: One-side/Both-side x Cross OFF/ON",
+            "2-way: Cross OFF/ON only",
+            "None: run table rows as shown",
+        ],
+        index=0,
+        help="Recommended: every base geometry becomes four matched scenarios so flight-side and cross-flight effects can be isolated.",
+    )
+    one_side_choice = st.selectbox(
+        "Representative One-Side Direction",
+        ["Left", "Right"],
+        index=0,
+        disabled=not expansion_mode.startswith("4-way"),
+        help="The One-side case uses only this oblique side. Both-side always uses Left + Right.",
+    )
+    planned_rows = edited_df.to_dict(orient="records")
+    multiplier = 4 if expansion_mode.startswith("4-way") else (2 if expansion_mode.startswith("2-way") else 1)
+    planned_count = len(planned_rows) * multiplier
+    ccount1, ccount2, ccount3 = st.columns(3)
+    ccount1.metric("Base scenarios", len(planned_rows))
+    ccount2.metric("Expansion factor", f"{multiplier}x")
+    ccount3.metric("Scenarios to run", planned_count)
+    if expansion_mode.startswith("4-way"):
+        st.caption(f"Each base row -> {one_side_choice}-side/XOFF, {one_side_choice}-side/XON, Both-side/XOFF, Both-side/XON. Example: 81 base geometries -> 324 scenarios.")
+    if planned_count > 200:
+        st.warning("Large batch: generating individual Full HTML/PDF/KMZ files for hundreds of scenarios can take substantial time and create a large ZIP. For screening, keep the batch-level Full Report and CSVs, and optionally disable per-scenario HTML/PDF/KMZ below.")
+
+    bc0, bc1, bc2, bc3 = st.columns(4)
+    include_batch_full_html = bc0.checkbox("Full HTML for each scenario", value=True)
+    include_batch_pdf = bc1.checkbox("Executive PDF for each scenario", value=False)
+    include_batch_kmz = bc2.checkbox("KMZ for each scenario", value=False)
+    include_batch_mission = bc3.checkbox("Mission-transfer files", value=False)
+
+    st.markdown("**Batch output:** the ZIP always contains a batch-level Full HTML report, Batch Comparison CSV, Batch Scenarios CSV, a Cross-Flight Pair Comparison CSV when matched pairs exist, and a Side/Cross Four-Way Comparison CSV when the 4-way expansion is used. Each scenario also includes summary, pre-flight accuracy, constraints, JSON, acquisition settings, plus optional Full HTML/PDF/KMZ/mission files.")
+
+    if st.button("Run Batch and Build Report Package", type="primary", key="run_batch_analysis"):
+        try:
+            batch_rows_ui = edited_df.to_dict(orient="records")
+            if expansion_mode.startswith("4-way"):
+                batch_rows_ui = expand_side_cross_rows(batch_rows_ui, one_side_choice)
+            elif expansion_mode.startswith("2-way"):
+                batch_rows_ui = pair_cross_flight_rows(batch_rows_ui)
+            if not batch_rows_ui:
+                st.error("The batch table is empty.")
+            else:
+                with st.spinner(f"Running {len(batch_rows_ui)} scenarios and building reports..."):
+                    batch_zip, batch_comp = build_batch_zip_bytes(
+                        s, batch_template, batch_rows_ui, center_lonlat, center_xy, centerline_source,
+                        include_full_html=include_batch_full_html,
+                        include_pdf=include_batch_pdf,
+                        include_kmz=include_batch_kmz,
+                        include_mission_transfer=include_batch_mission,
+                    )
+                st.session_state["batch_zip_bytes"] = batch_zip
+                st.session_state["batch_comparison_df"] = batch_comp
+                st.session_state["batch_name"] = batch_template
+                st.success(f"Batch complete: {len(batch_rows_ui)} scenarios processed.")
+        except Exception as e:
+            st.exception(e)
+
+    if st.session_state.get("batch_comparison_df") is not None:
+        st.markdown("### Batch Comparison Results")
+        st.dataframe(st.session_state["batch_comparison_df"], width="stretch")
+        pair_ui = build_cross_flight_pair_comparison(st.session_state["batch_comparison_df"])
+        if not pair_ui.empty:
+            st.markdown("### Cross-Flight Pair Comparison (ON minus OFF)")
+            st.dataframe(pair_ui, width="stretch")
+        factorial_ui = build_side_cross_factorial_comparison(st.session_state["batch_comparison_df"])
+        if not factorial_ui.empty:
+            st.markdown("### Flight-Side x Cross-Flight Four-Way Comparison")
+            st.caption("Main effects and interaction for One-side vs Both-side and Cross OFF vs ON.")
+            st.dataframe(factorial_ui, width="stretch")
+    if st.session_state.get("batch_zip_bytes"):
+        batch_filename = safe_name(st.session_state.get("batch_name", "Batch_Analysis")) + "_Report_Package.zip"
+        st.download_button(
+            "Download Batch Report Package (ZIP)",
+            data=st.session_state["batch_zip_bytes"],
+            file_name=batch_filename,
+            mime="application/zip",
+            key="batch_report_package_download",
+        )
+
 # Sidebar summary and quick export.
 with st.sidebar:
     st.markdown(f"**Scenario:** {s.scenario_name}")
@@ -2444,6 +3603,10 @@ with st.sidebar:
     st.markdown(f"**Altitude:** {s.altitude_ft:g} ft")
     st.markdown(f"**Offset:** {s.offset_from_road_edge_ft:g} ft")
     st.markdown(f"**Flight:** {s.flight_mode}")
+    st.markdown(f"**Look Angle:** {s.oblique_look_angle_deg:g}°")
+    st.markdown(f"**Speed:** {s.flight_speed_mps:g} m/s")
+    st.markdown(f"**Shutter:** 1/{round(1.0/s.shutter_speed_s):d} s")
+    st.markdown(f"**ISO:** {s.iso}")
     st.markdown(f"**Cross Flight:** {'Yes' if s.cross_flight else 'No'}")
     if flight.get("side_line_spacing_ft") is None:
         st.markdown(f"**Overlap:** {s.forward_overlap_pct:g} / N.A.")
@@ -2451,6 +3614,11 @@ with st.sidebar:
         st.markdown(f"**Overlap:** {s.forward_overlap_pct:g} / {s.side_overlap_pct:g}")
         st.markdown(f"**Line Spacing:** {flight['side_line_spacing_ft']:.1f} ft")
     st.markdown(f"**GCPs:** {len(targets['gcps'])}")
+    sidebar_gcp_m = gcp_layout_metrics(geometry["centerline"], s, targets, geometry)
+    st.markdown(f"**GCP Pattern:** {s.gcp_pattern}")
+    st.markdown(f"**Positioning:** {s.positioning_mode}")
+    if sidebar_gcp_m.get("gcp_density_per_km") is not None:
+        st.markdown(f"**GCP Density:** {sidebar_gcp_m['gcp_density_per_km']:.2f}/km")
     st.markdown(f"**Checkpoints:** {len(targets['checkpoints'])}")
     st.markdown(f"**Roadway CPs:** {sum(1 for cp in targets['checkpoints'] if str(cp.get('zone', '')).startswith('Roadway'))}")
     st.markdown(f"**Outside CPs:** {sum(1 for cp in targets['checkpoints'] if cp.get('zone') == 'Outside Roadway')}")

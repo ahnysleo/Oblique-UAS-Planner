@@ -1,10 +1,5 @@
 streamlit
-numpy
 pandas
+numpy
 matplotlib
-shapely
-pyproj
-simplekml
-lxml
 reportlab
-Pillow
